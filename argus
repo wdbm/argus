@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+
+"""
+################################################################################
+#                                                                              #
+# Argus                                                                        #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This program is an image viewer/saver.                                       #
+#                                                                              #
+# copyright (C) 2026 William Breaden Madden                                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This program is free software: you can redistribute it and/or modify it      #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the License, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This program is distributed in the hope that it will be useful, but WITHOUT  #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public License, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+
+Usage:
+    argus [--status-messages | --no-status-messages] [<path>]
+    argus (-h | --help)
+
+Options:
+    -h, --help             Show this display.
+    --status-messages      Enable transient status messages.
+    --no-status-messages   Disable transient status messages.
+"""
+
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+from docopt import docopt
+import json
+import os
+from pathlib import Path
+from queue import Empty, SimpleQueue
+import re
+import shutil
+import tkinter as tk
+from tkinter import Toplevel, filedialog, messagebox
+
+from PIL import Image, ImageTk
+try:
+    from send2trash import send2trash
+except Exception:
+    send2trash = None
+
+__VERSION__ = "2026-03-30T2315Z"
+
+APPLICATION_NAME                           = "argus"
+CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
+CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
+RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
+MAX_RECENTS                                = 10
+RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
+RECENT_DIRECTORY_BUTTON_SELECTED_BG        = "#a5a5a5"
+RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG = "#8e8e8e"
+MAX_RENDER_SIDE                            = 5000
+MIPMAP_MIN_SIDE                            = 256
+STATUS_MESSAGE_MS                          = 500
+SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif"}
+
+SHORTCUT_HELP_ROWS = (
+    ("Left / Right"         , "Previous or next image"                   ),
+    ("Scroll mouse wheel"   , "Zoom at the pointer position"             ),
+    ("+, =, -, 0"           , "Zoom in, zoom out, reset zoom"            ),
+    ("Left-click and drag"  , "Pan the image"                            ),
+    ("F11/Double left-click", "Toggle full-screen"                       ),
+    ("s"                    , "Open the save dialogue"                   ),
+    ("Ctrl+s"               , "Quick-save to the last directory"         ),
+    ("Alt+1-9, 0"           , "Quick-save to an indexed recent directory"),
+    ("h"                    , "Hide or show the status bar"              ),
+    ("F1/?"                 , "Toggle this shortcuts window"             ),
+    ("Delete"               , "Move the current image to the trash"      ),
+    ("Esc"                  , "Leave full-screen or close the viewer"    ),
+)
+
+# recents --------------------------------------------------------------
+
+def load_recents():
+    if RECENTS_FILE.exists():
+        try:
+            data = json.loads(RECENTS_FILE.read_text())
+            return [p for p in data if Path(p).is_dir()]
+        except Exception:
+            pass
+    return []
+
+def save_recents(recents):
+    try:
+        RECENTS_FILE.write_text(json.dumps(recents[:MAX_RECENTS], indent=2))
+    except Exception:
+        pass
+
+def clear_recents():
+    try:
+        RECENTS_FILE.write_text("[]")
+    except Exception:
+        pass
+
+def add_recent_dir(path_str):
+    p = Path(path_str).resolve()
+    if p.is_file(): p = p.parent
+    path_str = str(p)
+    recents = load_recents()
+    if path_str in recents: recents.remove(path_str)
+    recents.insert(0, path_str)
+    save_recents(recents)
+    return recents
+
+def most_recent_dir():
+    recents = load_recents()
+    return Path(recents[0]).resolve() if recents else None
+
+def indexed_recents():
+    recents = [Path(p).resolve() for p in load_recents()[:MAX_RECENTS]]
+    return list(zip(RECENT_DIRECTORY_KEYS, recents))
+
+def recent_dir_for_key(key: int):
+    for display_key, path in indexed_recents():
+        if display_key == key:
+            return path
+    return None
+
+# utilities ------------------------------------------------------------
+
+def unique_destination_path(destination_directory: Path, filename: str) -> Path:
+    base = Path(filename).stem
+    ext = Path(filename).suffix
+    candidate = destination_directory / (base + ext)
+    n = 1
+    while candidate.exists():
+        candidate = destination_directory / f"{base} (copy {n}){ext}"
+        n += 1
+    return candidate
+
+def sanitise_filename(name: str) -> str:
+    name = name.strip().replace(os.sep, "")
+    return re.sub(r'[\x00-\x1f<>:"|?*]', "_", name) or "image"
+
+def is_supported_image_path(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+
+def resolve_input_target(path_str: str) -> tuple[Path, Path | None]:
+    path = Path(path_str).expanduser().resolve()
+    if not path.exists():
+        raise ValueError(f"path does not exist: {path}")
+    if path.is_dir():
+        return path, None
+    if is_supported_image_path(path):
+        return path.parent, path
+    if path.is_file():
+        raise ValueError(f"file type is not supported: {path}")
+    raise ValueError(f"path is neither a regular file nor a directory: {path}")
+
+def collect_image_paths(directory: Path):
+    try:
+        return sorted([path for path in directory.iterdir() if is_supported_image_path(path)])
+    except OSError as exc:
+        raise ValueError(f"could not inspect directory: {directory} ({exc})") from exc
+
+# threaded image cache -------------------------------------------------
+
+class ImageCache:
+    """Small LRU cache of decoded PIL Images + mipmaps, loaded off-thread."""
+    def __init__(self, max_items=5, workers=2):
+        self.max_items = max_items
+        self.cache = OrderedDict()
+        self.futures: dict[Path, Future] = {}
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.completed = SimpleQueue()
+        self.closed = False
+
+    def _close_entry(self, orig: Image.Image, mips: list[Image.Image]):
+        try:
+            orig.close()
+        except Exception:
+            pass
+        for mip in mips:
+            try:
+                mip.close()
+            except Exception:
+                pass
+
+    def _close_result(self, data):
+        orig, mips = data
+        self._close_entry(orig, mips)
+
+    def _build_mipmaps(self, base: Image.Image):
+        mipmaps = []
+        w, h = base.size
+        while True:
+            w //= 2; h //= 2
+            if w < 1 or h < 1: break
+            if min(w, h) < MIPMAP_MIN_SIDE: break
+            lvl = base.resize((w, h), Image.Resampling.LANCZOS)
+            mipmaps.append(lvl)
+        return mipmaps
+
+    def _load_image(self, path: Path):
+        with Image.open(path) as im:
+            im.load()
+            orig = im.copy()
+        mipmaps = self._build_mipmaps(orig)
+        return (orig, mipmaps)
+
+    def _store_completed(self, path: Path, fut: Future):
+        if self.closed:
+            try:
+                self._close_result(fut.result())
+            except Exception:
+                pass
+            return
+        self.completed.put((path, fut))
+
+    def process_completed(self):
+        while True:
+            try:
+                path, fut = self.completed.get_nowait()
+            except Empty:
+                return
+
+            if self.closed:
+                try:
+                    self._close_result(fut.result())
+                except Exception:
+                    pass
+                continue
+
+            if self.futures.get(path) is not fut:
+                try:
+                    self._close_result(fut.result())
+                except Exception:
+                    pass
+                continue
+
+            self.futures.pop(path, None)
+            try:
+                data = fut.result()
+            except Exception:
+                continue
+            self.cache[path] = data
+            while len(self.cache) > self.max_items:
+                _, (orig, mips) = self.cache.popitem(last=False)
+                self._close_entry(orig, mips)
+
+    def request(self, path: Path) -> Future:
+        self.process_completed()
+        path = path.resolve()
+        if path in self.cache:
+            data = self.cache.pop(path)
+            self.cache[path] = data
+            f = Future()
+            f.set_result(data)
+            return f
+        if path in self.futures:
+            return self.futures[path]
+
+        fut = self.pool.submit(self._load_image, path)
+        self.futures[path] = fut
+        fut.add_done_callback(lambda _f, p=path: self._store_completed(p, _f))
+        return fut
+
+    def discard(self, path: Path):
+        self.process_completed()
+        path = path.resolve()
+        fut = self.futures.pop(path, None)
+        if fut and not fut.done():
+            fut.cancel()
+        data = self.cache.pop(path, None)
+        if data:
+            orig, mips = data
+            self._close_entry(orig, mips)
+
+    def shutdown(self):
+        self.closed = True
+        self.process_completed()
+        for fut in list(self.futures.values()):
+            if not fut.done():
+                fut.cancel()
+        self.pool.shutdown(wait=False)
+        for _, (orig, mips) in list(self.cache.items()):
+            self._close_entry(orig, mips)
+        self.cache.clear()
+        self.futures.clear()
+
+# dialogues ------------------------------------------------------------
+
+class RecentSaveDialog(Toplevel):
+    """
+    multi-select dialogue with:
+      - filename entry (pre-filled, editable)
+      - toggle buttons for recent directories (multi-select)
+      - digit keys 1-9,0: toggle the indexed recent directories
+      - Browse... to add/select a directory
+      - Save button writes to all selected directories + filename
+      - clear recent directories
+      - Alt+digit keys 1-9,0: immediate save to that indexed recent directory
+    """
+    def __init__(self, master, on_save, default_filename: str, last_selected=None):
+        super().__init__(master)
+        self.title("Save to...")
+        self.resizable(False, False)
+        self.on_save = on_save
+        self.configure(padx=12, pady=12)
+        self.transient(master)
+        self.grab_set()
+        self.selected_directories = set(str(p) for p in (last_selected or []))
+
+        # filename row
+        fn_frame = tk.Frame(self); fn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tk.Label(fn_frame, text="Filename:").pack(side="left")
+        self.fn_var = tk.StringVar(value=default_filename)
+        self.fn_entry = tk.Entry(fn_frame, textvariable=self.fn_var, width=48)
+        self.fn_entry.pack(side="left", padx=(6, 0))
+
+        # recents header
+        hdr = tk.Frame(self); hdr.grid(row=1, column=0, sticky="ew")
+        tk.Label(hdr, text="Recent directories (1-9,0)", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        tk.Button(hdr, text="Clear recent directories", command=self._clear_recents).pack(side="right")
+
+        # recents grid (numbered)
+        self.btn_frame = tk.Frame(self); self.btn_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 6))
+        self._render_recent_buttons()
+
+        # selected indicator
+        sel_frame = tk.Frame(self); sel_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        tk.Label(sel_frame, text="Selected:").pack(side="left")
+        self.selected_var = tk.StringVar(value=self._selected_summary())
+        tk.Label(sel_frame, textvariable=self.selected_var, anchor="w", width=56).pack(side="left", padx=(6, 0))
+
+        # controls
+        ctl = tk.Frame(self); ctl.grid(row=4, column=0, sticky="ew")
+        self.save_btn = tk.Button(ctl, text="Save", state="disabled", command=self._do_save)
+        self.save_btn.pack(side="right")
+        tk.Button(ctl, text="Browse...", command=self._browse).pack(side="left", padx=(0, 6))
+        tk.Button(ctl, text="Cancel", command=self._cancel).pack(side="left")
+
+        # dialogue-local hotkeys
+        self.bind("<s>", self._handle_save_keypress)
+        self.bind("<S>", self._handle_save_keypress)
+        self.bind("<Escape>", self._cancel)
+        self.bind("<Tab>", self._focus_next_widget)
+        self.bind("<ISO_Left_Tab>", self._focus_previous_widget)
+        self.bind("<Shift-Tab>", self._focus_previous_widget)
+        for n in range(10):
+            self.bind(f"<KeyPress-{n}>", lambda e, k=n: self._toggle_index(k))
+            self.bind(f"<KP_{n}>", lambda e, k=n: self._toggle_index(k))
+            self.bind(f"<Alt-KeyPress-{n}>", lambda e, k=n: self._save_to_index(k))
+
+        # centre on parent
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.after_idle(self.focus_set)
+
+        self._update_save_state()
+
+    def _selected_summary(self):
+        n = len(self.selected_directories)
+        if n == 0: return "(none)"
+        if n == 1: return list(self.selected_directories)[0]
+        return f"{n} directories"
+
+    def _refresh_selection_ui(self):
+        self.selected_var.set(self._selected_summary())
+        self._render_recent_buttons()
+        self._update_save_state()
+
+
+    def _refresh_parent_status(self):
+        if hasattr(self.master, "_refresh_status_recents"):
+            self.master._refresh_status_recents()
+
+    def _focus_is_text_input(self):
+        focus = self.focus_get()
+        if focus is None:
+            return False
+        return focus.winfo_class() in {"Entry", "TEntry", "Text", "Spinbox"}
+
+    def _focus_next_widget(self, event=None):
+        current = self.focus_get() or self
+        target = current.tk_focusNext()
+        if target is not None:
+            target.focus_set()
+        return "break"
+
+    def _focus_previous_widget(self, event=None):
+        current = self.focus_get() or self
+        target = current.tk_focusPrev()
+        if target is not None:
+            target.focus_set()
+        return "break"
+
+    def _render_recent_buttons(self):
+        for w in self.btn_frame.winfo_children(): w.destroy()
+        recents = indexed_recents()
+        if not recents:
+            tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
+            return
+        columns = 2
+        for position, (display_key, p) in enumerate(recents):
+            column, row = (position % columns), (position // columns)
+            path = str(p)
+            short = p.name or path
+            active = path in self.selected_directories
+            text = f"[{display_key}] {short}\n{path}"
+            button_kwargs = {
+                "text": text,
+                "justify": "left",
+                "anchor": "w",
+                "width": 44,
+                "relief": ("sunken" if active else "raised"),
+                "command": lambda pp=path: self._toggle_dir(pp),
+            }
+            if active:
+                button_kwargs.update({
+                    "bg": RECENT_DIRECTORY_BUTTON_SELECTED_BG,
+                    "activebackground": RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG,
+                })
+            b = tk.Button(self.btn_frame, **button_kwargs)
+            b.grid(row=row, column=column, padx=4, pady=4, sticky="ew")
+
+    def _toggle_dir(self, path):
+        if path in self.selected_directories:
+            self.selected_directories.remove(path)
+        else:
+            self.selected_directories.add(path)
+        self._refresh_selection_ui()
+
+    def _toggle_index(self, idx: int):
+        if self._focus_is_text_input():
+            return None
+        target_directory = recent_dir_for_key(idx)
+        if target_directory is None:
+            return "break"
+        self._toggle_dir(str(target_directory))
+        return "break"
+
+    def _browse(self):
+        self.grab_release()
+        try:
+            d = filedialog.askdirectory(
+                parent=self,
+                title="Choose a directory to save into",
+            )
+        finally:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        if d:
+            add_recent_dir(d)
+            self.selected_directories.add(str(Path(d).resolve()))
+            self._refresh_selection_ui()
+            self._refresh_parent_status()
+
+    def _update_save_state(self):
+        self.save_btn.config(state=("normal" if self.selected_directories else "disabled"))
+
+    def _clear_recents(self):
+        if messagebox.askyesno("Clear recent directories", "Clear the recent directories list?", parent=self):
+            clear_recents()
+            self.selected_directories.clear()
+            self._refresh_selection_ui()
+            self._refresh_parent_status()
+
+    def _close_dialog(self):
+        self.grab_release()
+        self.destroy()
+
+    def _save_to_index(self, idx: int):
+        target_directory = recent_dir_for_key(idx)
+        if target_directory is None:
+            return "break"
+        name = sanitise_filename(self.fn_var.get())
+        if not name:
+            messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
+            return "break"
+        self._close_dialog()
+        self.on_save([target_directory], name)
+        return "break"
+
+    def _handle_save_keypress(self, event=None):
+        if self._focus_is_text_input():
+            return None
+        self._do_save()
+        return "break"
+
+    def _do_save(self):
+        if not self.selected_directories:
+            messagebox.showwarning("Choose directories", "Please select at least one directory.", parent=self)
+            return
+        name = sanitise_filename(self.fn_var.get())
+        if not name:
+            messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
+            return
+        self._close_dialog()
+        directories = [Path(p).resolve() for p in self.selected_directories]
+        self.on_save(directories, name)
+
+    def _cancel(self):
+        self._close_dialog()
+        return "break"
+
+class ShortcutHelpDialog(Toplevel):
+    def __init__(self, master, rows, on_close=None):
+        super().__init__(master)
+        self.title("Shortcuts")
+        self.resizable(False, False)
+        self.configure(padx=12, pady=12)
+        self.transient(master)
+        self.on_close = on_close
+
+        tk.Label(self, text="Keyboard and mouse controls", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        table = tk.Frame(self)
+        table.pack(anchor="w", pady=(8, 12))
+        for row_index, (shortcut, description) in enumerate(rows):
+            tk.Label(
+                table,
+                text=shortcut,
+                justify="left",
+                anchor="w",
+                font=("TkFixedFont", 10),
+            ).grid(row=row_index, column=0, sticky="w", padx=(0, 18), pady=1)
+            tk.Label(
+                table,
+                text=description,
+                justify="left",
+                anchor="w",
+            ).grid(row=row_index, column=1, sticky="w", pady=1)
+        tk.Button(self, text="Close", command=self._close).pack(anchor="e")
+
+        self.bind("<Escape>", self._close)
+        self.bind("<F1>", self._close)
+        self.bind("?", self._close)
+
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.focus_set()
+
+    def _close(self, event=None):
+        callback = self.on_close
+        self.on_close = None
+        if callback is not None:
+            callback()
+        self.destroy()
+        return "break"
+
+# application ----------------------------------------------------------
+
+class ImageViewer(tk.Tk):
+    def __init__(self, path: str = ".", status_messages: bool = True):
+        resolved_directory, initial_image_path = resolve_input_target(path)
+        files = collect_image_paths(resolved_directory)
+        super().__init__()
+        self.title("Argus")
+        self.geometry("1000x740")
+
+        # canvas for precise zoom/pan
+        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        # status bar: indexed recent directories and transient messages
+        self.status = tk.Label(self, text="", anchor="w")
+        self.status.pack(fill="x", side="bottom")
+        self.status_bar_visible = True
+        self.status_messages_enabled = status_messages
+        self._status_message = None
+        self._status_message_job = None
+        self._refresh_status_recents()
+
+        self.dir = resolved_directory
+        self.files = files
+        self.i = 0
+        if initial_image_path is not None:
+            try:
+                self.i = self.files.index(initial_image_path)
+            except ValueError as exc:
+                raise ValueError(f"image is not available in directory listing: {initial_image_path}") from exc
+        self.current_image_path = None
+        self.current_img = None
+        self.current_levels: list[Image.Image] = []
+        self.current_future: Future | None = None
+        self.current_photo = None
+        self.canvas_img_id = None
+
+        self.cache = ImageCache(max_items=5, workers=2)
+        self._cache_pump_job = self.after(50, self._pump_cache_updates)
+        self.help_dialog = None
+
+        self.is_fullscreen = False
+        self.zoom = 1.0
+        self.ox = 0
+        self.oy = 0
+        self.drag_start = None
+        self.last_selected_directories = []
+        self.auto_center_on_resize = True
+
+        # progressive render / debounce
+        self._refine_job = None
+        self._wheel_job = None
+        self._pending_zoom = None
+
+        # key bindings
+        self.bind("<Right>", self.next_image)
+        self.bind("<Left>", self.prev_image)
+        self.bind("<Delete>", self.delete_to_trash)
+        self.bind("<s>", self.open_save_dialog)
+        self.bind("h", self.toggle_status_bar)
+        self.bind("<Control-s>", self.quick_save)
+        for n in range(10):
+            self.bind(f"<Alt-KeyPress-{n}>", lambda e, k=n: self.quick_save_to_index(k))
+        self.bind("<F11>", self.toggle_fullscreen)
+        self.bind("<F1>", self.toggle_help_dialog)
+        self.bind("?", self.toggle_help_dialog)
+        self.bind("<Escape>", self.escape_action)
+        self.bind("<Configure>", self._maybe_resize)
+
+        # keyboard zoom
+        self.bind("+", lambda e: self.zoom_in_center())
+        weq = lambda e: self.zoom_in_center()
+        self.bind("=", weq)
+        self.bind("-", lambda e: self.zoom_out_center())
+        self.bind("0", lambda e: self.zoom_reset())
+        self.bind("<Key-plus>", lambda e: self.zoom_in_center())
+        self.bind("<Key-equal>", lambda e: self.zoom_in_center())
+        self.bind("<Key-minus>", lambda e: self.zoom_out_center())
+        self.bind("<Key-0>", lambda e: self.zoom_reset())
+        self.bind("<KP_Add>", lambda e: self.zoom_in_center())
+        self.bind("<KP_Subtract>", lambda e: self.zoom_out_center())
+        self.bind("<KP_0>", lambda e: self.zoom_reset())
+
+        # mouse wheel zoom
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)   # Windows/macOS
+        self.canvas.bind("<Button-4>",  lambda e: self._queue_zoom_at(e.x, e.y, 1.1))   # X11
+        self.canvas.bind("<Button-5>",  lambda e: self._queue_zoom_at(e.x, e.y, 1/1.1))
+
+        # drag to pan, double-click for fullscreen
+        self.canvas.bind("<ButtonPress-1>", self._start_pan)
+        self.canvas.bind("<B1-Motion>",     self._do_pan)
+        self.canvas.bind("<Double-Button-1>", self._toggle_fullscreen_from_double_click)
+
+        if self.files:
+            self._show_current()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # files ------------------------------------------------------------
+
+    def _pump_cache_updates(self):
+        self._cache_pump_job = None
+        self.cache.process_completed()
+        if self.winfo_exists():
+            self._cache_pump_job = self.after(50, self._pump_cache_updates)
+
+    def _clear_help_dialog(self):
+        self.help_dialog = None
+
+    def toggle_help_dialog(self, event=None):
+        focus = self.focus_get()
+        if event is not None and getattr(event, "char", "") == "?" and focus is not None and focus.winfo_class() == "Entry":
+            return None
+        if self.help_dialog is not None and self.help_dialog.winfo_exists():
+            dialog = self.help_dialog
+            self.help_dialog = None
+            dialog.destroy()
+            return "break"
+        self.help_dialog = ShortcutHelpDialog(self, SHORTCUT_HELP_ROWS, on_close=self._clear_help_dialog)
+        return "break"
+
+    # fit and render ---------------------------------------------------
+
+    def _fit_scale(self, img_w, img_h):
+        self.update_idletasks()
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        return min(cw / img_w, ch / img_h)
+
+    def _pick_source_for_size(self, target_w, target_h) -> Image.Image:
+        candidates = [(self.current_img.width, self.current_img.height, self.current_img)]
+        for m in self.current_levels:
+            candidates.append((m.width, m.height, m))
+        eligible = [c for c in candidates if c[0] >= target_w and c[1] >= target_h]
+        if eligible:
+            w, h, img = min(eligible, key=lambda t: t[0] * t[1])
+            return img
+        w, h, img = max(candidates, key=lambda t: t[0] * t[1])
+        return img
+
+    def _clamp_view_offsets(self, scale, canvas_width, canvas_height):
+        img_w = self.current_img.width * scale
+        img_h = self.current_img.height * scale
+
+        if img_w <= canvas_width:
+            self.ox = (canvas_width - img_w) / 2
+        else:
+            self.ox = min(0.0, max(canvas_width - img_w, self.ox))
+
+        if img_h <= canvas_height:
+            self.oy = (canvas_height - img_h) / 2
+        else:
+            self.oy = min(0.0, max(canvas_height - img_h, self.oy))
+
+    def _render_on_canvas(self, resample=Image.Resampling.BILINEAR, refine=False):
+        if not self.current_img: return
+
+        base_w, base_h = self.current_img.width, self.current_img.height
+        base_scale = self._fit_scale(base_w, base_h)
+        scale = max(0.05, base_scale * self.zoom)
+
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+
+        self._clamp_view_offsets(scale, cw, ch)
+
+        # compute visible image rectangle in original image coordinates
+        # canvas (0, 0) maps to image (-ox, -oy) at scale
+        x0_img = (0 - self.ox) / scale
+        y0_img = (0 - self.oy) / scale
+        x1_img = (cw - self.ox) / scale
+        y1_img = (ch - self.oy) / scale
+
+        # clip to image bounds
+        x0_img = max(0.0, min(float(base_w), x0_img))
+        y0_img = max(0.0, min(float(base_h), y0_img))
+        x1_img = max(0.0, min(float(base_w), x1_img))
+        y1_img = max(0.0, min(float(base_h), y1_img))
+
+        if x1_img <= x0_img or y1_img <= y0_img:
+            return # nothing visible (should not happen with clamping)
+
+        # desired on-screen size of slice
+        display_w = int((x1_img - x0_img) * scale)
+        display_h = int((y1_img - y0_img) * scale)
+
+        # safety cap
+        if max(display_w, display_h) > MAX_RENDER_SIDE:
+            clamp_ratio = MAX_RENDER_SIDE / max(display_w, display_h)
+            display_w = max(1, int(display_w * clamp_ratio))
+            display_h = max(1, int(display_h * clamp_ratio))
+
+        # choose best source image and map crop to its coordinates
+        src_img = self._pick_source_for_size(display_w, display_h)
+        factor = src_img.width / base_w # scale from original to chosen source coordinates
+        src_box = (
+            int(x0_img * factor),
+            int(y0_img * factor),
+            int(x1_img * factor),
+            int(y1_img * factor),
+        )
+        # crop & resize to on-screen size
+        if src_box[2] <= src_box[0] or src_box[3] <= src_box[1]:
+            return
+        slice_img = src_img.crop(src_box)
+        display = slice_img.resize((max(1, display_w), max(1, display_h)), resample)
+
+        self.current_photo = ImageTk.PhotoImage(display)
+
+        # where to draw it on canvas -- top-left of visible slice
+        draw_x = int(max(self.ox, 0))
+        draw_y = int(max(self.oy, 0))
+
+        if self.canvas_img_id is None:
+            self.canvas_img_id = self.canvas.create_image(draw_x, draw_y, image=self.current_photo, anchor="nw")
+        else:
+            self.canvas.itemconfigure(self.canvas_img_id, image=self.current_photo)
+            self.canvas.coords(self.canvas_img_id, draw_x, draw_y)
+
+        # optional refine pass
+        if refine:
+            if self._refine_job:
+                try: self.after_cancel(self._refine_job)
+                except Exception: pass
+            self._refine_job = self.after_idle(self._refine_lanczos)
+
+    def _refine_lanczos(self):
+        self._refine_job = None
+        self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
+
+    def _center_image(self):
+        if not self.current_img: return
+        base_scale = self._fit_scale(self.current_img.width, self.current_img.height)
+        scale = max(0.05, base_scale * self.zoom)
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        w = int(self.current_img.width * scale)
+        h = int(self.current_img.height * scale)
+        if max(w, h) > MAX_RENDER_SIDE:
+            clamp_ratio = MAX_RENDER_SIDE / max(w, h)
+            w = max(1, int(w * clamp_ratio))
+            h = max(1, int(h * clamp_ratio))
+        self.ox = (cw - w) // 2
+        self.oy = (ch - h) // 2
+
+    # preload neighbors ------------------------------------------------
+    def _prefetch_neighbors(self):
+        if not self.files: return
+        if self.i + 1 < len(self.files):
+            self.cache.request(self.files[self.i + 1])
+        if self.i - 1 >= 0:
+            self.cache.request(self.files[self.i - 1])
+
+    def _show_current(self):
+        path = self.files[self.i]
+        self.current_image_path = path
+        self.zoom = 1.0
+        self.auto_center_on_resize = True
+
+        self.current_future = self.cache.request(path)
+        self.after(0, self._check_current_future)
+
+        self.title(f"Argus - {path.name}")
+        self._prefetch_neighbors()
+
+    def _check_current_future(self):
+        self.cache.process_completed()
+        if not self.current_future: return
+        if self.current_future.done():
+            try:
+                self.current_img, self.current_levels = self.current_future.result()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open image:\n{e}")
+                return
+            self._center_image()
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+        else:
+            self.after(10, self._check_current_future)
+
+    def _maybe_resize(self, event=None):
+        if self.current_img and self.canvas.winfo_width() > 1 and self.canvas.winfo_height() > 1:
+            # keep fit-to-window images centred after resize unless view was adjusted manually
+            if self.auto_center_on_resize:
+                self._center_image()
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+
+    # navigation (wrapped) ---------------------------------------------
+    def next_image(self, event=None):
+        if not self.files: return
+        self.i = (self.i + 1) % len(self.files)
+        self._show_current()
+
+    def prev_image(self, event=None):
+        if not self.files: return
+        self.i = (self.i - 1) % len(self.files)
+        self._show_current()
+
+    # fullscreen -------------------------------------------------------
+    def toggle_fullscreen(self, event=None):
+        self.is_fullscreen = not self.is_fullscreen
+        self.attributes("-fullscreen", self.is_fullscreen)
+
+    def escape_action(self, event=None):
+        if self.is_fullscreen:
+            self.is_fullscreen = False
+            self.attributes("-fullscreen", False)
+        else:
+            self._on_close()
+
+    # zoom helpers -----------------------------------------------------
+    def _apply_zoom_at(self, cx, cy, factor, progressive=True):
+        if not self.current_img: return
+        self.auto_center_on_resize = False
+        img = self.current_img
+        base_scale = self._fit_scale(img.width, img.height)
+        old_scale = max(0.05, base_scale * self.zoom)
+
+        img_x = (cx - self.ox) / old_scale
+        img_y = (cy - self.oy) / old_scale
+
+        trial_zoom = min(8.0, max(0.125, self.zoom * factor))
+        trial_scale = max(0.05, base_scale * trial_zoom)
+
+        trial_w = img.width * trial_scale
+        trial_h = img.height * trial_scale
+        if max(trial_w, trial_h) > MAX_RENDER_SIDE:
+            clamp_ratio = MAX_RENDER_SIDE / max(trial_w, trial_h)
+            trial_scale *= clamp_ratio
+            trial_zoom = trial_scale / base_scale
+
+        self.zoom = trial_zoom
+        new_scale = trial_scale
+
+        self.ox = cx - img_x * new_scale
+        self.oy = cy - img_y * new_scale
+
+        if progressive:
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+        else:
+            self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
+
+    def zoom_in_center(self, step=0.1):
+        cw = max(1, self.canvas.winfo_width()); ch = max(1, self.canvas.winfo_height())
+        self._apply_zoom_at(cw // 2, ch // 2, 1 + step, progressive=True)
+
+    def zoom_out_center(self, step=0.1):
+        cw = max(1, self.canvas.winfo_width()); ch = max(1, self.canvas.winfo_height())
+        self._apply_zoom_at(cw // 2, ch // 2, 1 / (1 + step), progressive=True)
+
+    def zoom_reset(self):
+        self.zoom = 1.0
+        self.auto_center_on_resize = True
+        self._center_image()
+        self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+
+    # debounced wheel --------------------------------------------------
+    def _queue_zoom_at(self, cx, cy, factor):
+        if self._pending_zoom is None:
+            self._pending_zoom = {"cx": cx, "cy": cy, "factor": factor}
+        else:
+            self._pending_zoom["cx"] = cx
+            self._pending_zoom["cy"] = cy
+            self._pending_zoom["factor"] *= factor
+        if self._wheel_job is None:
+            self._wheel_job = self.after(16, self._flush_wheel_zoom)
+
+    def _flush_wheel_zoom(self):
+        self._wheel_job = None
+        pz = self._pending_zoom
+        if not pz: return
+        self._pending_zoom = None
+        self._apply_zoom_at(pz["cx"], pz["cy"], pz["factor"], progressive=True)
+
+    def _on_mousewheel(self, event):
+        factor = 1.1 if event.delta > 0 else 1/1.1
+        self._queue_zoom_at(event.x, event.y, factor)
+
+    # pan (drag) -------------------------------------------------------
+    def _start_pan(self, event):
+        self.drag_start = (event.x, event.y, self.ox, self.oy)
+
+    def _do_pan(self, event):
+        if not self.drag_start: return
+        self.auto_center_on_resize = False
+        sx, sy, ox0, oy0 = self.drag_start
+        self.ox = ox0 + (event.x - sx)
+        self.oy = oy0 + (event.y - sy)
+        self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=False)
+
+    def _toggle_fullscreen_from_double_click(self, event=None):
+        self.drag_start = None
+        self.toggle_fullscreen(event)
+
+    # save flow --------------------------------------------------------
+    def _copy_current_image_to_directories(self, destination_directories: list[Path], name: str):
+        src = self.current_image_path
+        saved_directories = []
+        errors = []
+        for destination_directory in [Path(d).resolve() for d in destination_directories]:
+            try:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                add_recent_dir(str(destination_directory))
+                dst = unique_destination_path(destination_directory, name)
+                shutil.copy2(src, dst)
+                saved_directories.append(destination_directory)
+            except Exception as e:
+                errors.append((str(destination_directory), str(e)))
+        return saved_directories, errors
+
+    def _format_directory_summary(self, directories: list[Path]):
+        labels = [d.name or str(d) for d in directories]
+        if len(labels) == 1:
+            return labels[0]
+        if len(labels) == 2:
+            return f"{labels[0]} and {labels[1]}"
+        return f"{labels[0]}, {labels[1]}, and {len(labels) - 2} others"
+
+    def _show_save_result(self, saved_directories: list[Path], errors: list[tuple[str, str]], name: str):
+        if errors and saved_directories:
+            messagebox.showwarning("Partial save", f"Saved to {len(saved_directories)} directory(ies), but {len(errors)} failed.")
+        elif errors:
+            messagebox.showerror("Save failed", "\n".join([f"{d}: {e}" for d, e in errors]))
+        if saved_directories:
+            self._refresh_status_recents()
+            noun = "directory" if len(saved_directories) == 1 else "directories"
+            summary = self._format_directory_summary(saved_directories)
+            self._show_status_message(f"{name} saved to {noun} {summary}.")
+
+    def open_save_dialog(self, event=None):
+        if not self.current_image_path: return
+        default_name = self.current_image_path.name
+        RecentSaveDialog(self, self._save_to_directories, default_filename=default_name, last_selected=self.last_selected_directories)
+
+    def _save_to_directories(self, destination_directories: list[Path], typed_name: str):
+        try:
+            src_ext = self.current_image_path.suffix
+            name = sanitise_filename(typed_name)
+            if not Path(name).suffix:
+                name = f"{name}{src_ext}"
+
+            self.last_selected_directories = [Path(d).resolve() for d in destination_directories]
+            saved_directories, errors = self._copy_current_image_to_directories(self.last_selected_directories, name)
+            self._show_save_result(saved_directories, errors, name)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def quick_save(self, event=None):
+        if not self.current_image_path: return
+        targets = [Path(d).resolve() for d in self.last_selected_directories]
+        if not targets:
+            mru = most_recent_dir()
+            if mru:
+                targets = [mru]
+            else:
+                return self.open_save_dialog()
+
+        name = self.current_image_path.name
+        saved_directories, errors = self._copy_current_image_to_directories(targets, name)
+        self._show_save_result(saved_directories, errors, name)
+
+    def quick_save_to_index(self, idx: int):
+        if not self.current_image_path: return
+        target_directory = recent_dir_for_key(idx)
+        if target_directory is None: return
+        name = self.current_image_path.name
+        saved_directories, errors = self._copy_current_image_to_directories([target_directory], name)
+        self._show_save_result(saved_directories, errors, name)
+
+    # delete (to trash) ------------------------------------------------
+    def delete_to_trash(self, event=None):
+        if not self.current_image_path: return
+        if send2trash is None:
+            messagebox.showerror(
+                "send2trash not available"
+            )
+            return
+        victim = self.current_image_path
+        try:
+            send2trash(str(victim))
+        except Exception as e:
+            messagebox.showerror("Delete failed", f"Could not move to trash:\n{e}")
+            return
+        self.cache.discard(victim)
+        try:
+            idx = self.files.index(victim)
+        except ValueError:
+            idx = self.i
+        self.files = [p for p in self.files if p != victim]
+        deleted_name = victim.name
+        if not self.files:
+            self.canvas.delete("all")
+            self.canvas_img_id = None
+            self.current_image_path = None
+            self.current_img = None
+            self.current_levels = []
+            self.title("Argus -- (no images)")
+            self._show_status_message(f"Moved {deleted_name} to trash.")
+            return
+        self.i = (max(0, idx) - 1) % len(self.files)
+        self._show_current()
+        self._show_status_message(f"Moved {deleted_name} to trash.")
+
+    # status bar -------------------------------------------------------
+    def toggle_status_bar(self, event=None):
+        self.status_bar_visible = not self.status_bar_visible
+        if self.status_bar_visible:
+            self.status.pack(fill="x", side="bottom")
+            self._render_status()
+        else:
+            self.status.pack_forget()
+        self.update_idletasks()
+        if self.current_img and self.canvas.winfo_width() > 1 and self.canvas.winfo_height() > 1:
+            if self.auto_center_on_resize:
+                self._center_image()
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+
+    def _default_status_text(self):
+        recents = indexed_recents()
+        if not recents:
+            return "Recent directories: (none)"
+        parts = [f"{i}:{p.name or p}" for i, p in recents]
+        return "Recent directories: " + "  |  ".join(parts)
+
+    def _render_status(self):
+        if self._status_message is None:
+            self.status.config(text=self._default_status_text())
+        else:
+            self.status.config(text=self._status_message)
+
+    def _clear_status_message(self):
+        self._status_message_job = None
+        self._status_message = None
+        self._render_status()
+
+    def _show_status_message(self, text: str):
+        if not self.status_messages_enabled:
+            return
+        if self._status_message_job is not None:
+            try:
+                self.after_cancel(self._status_message_job)
+            except Exception:
+                pass
+        self._status_message = text
+        self._render_status()
+        self._status_message_job = self.after(STATUS_MESSAGE_MS, self._clear_status_message)
+
+    def _refresh_status_recents(self):
+        self._render_status()
+
+    # shutdown ---------------------------------------------------------
+    def _on_close(self):
+        if self._cache_pump_job is not None:
+            try:
+                self.after_cancel(self._cache_pump_job)
+            except Exception:
+                pass
+            self._cache_pump_job = None
+        if self.help_dialog is not None and self.help_dialog.winfo_exists():
+            self.help_dialog.destroy()
+            self.help_dialog = None
+        try:
+            self.cache.shutdown()
+        except Exception:
+            pass
+        self.destroy()
+
+if __name__ == "__main__":
+    options = docopt(__doc__, version=__VERSION__)
+    path = options["<path>"] or "."
+    status_messages = options["--status-messages"] or not options["--no-status-messages"]
+    try:
+        application = ImageViewer(path=path, status_messages=status_messages)
+    except ValueError as exc:
+        raise SystemExit(f"{APPLICATION_NAME}: {exc}") from exc
+    application.mainloop()
