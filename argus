@@ -59,16 +59,20 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-03-30T2315Z"
+__VERSION__ = "2026-03-31T1846Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
 CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
-MAX_RECENTS                                = 10
+MAX_RECENTS                                = 20
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
+MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
 RECENT_DIRECTORY_BUTTON_SELECTED_BG        = "#a5a5a5"
 RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG = "#8e8e8e"
+DIRECTORY_CHOOSER_WIDTH_SCALE              = 2
+DIRECTORY_CHOOSER_HEIGHT_SCALE             = 3
+DIRECTORY_CHOOSER_SCREEN_MARGIN            = 80
 MAX_RENDER_SIDE                            = 5000
 MIPMAP_MIN_SIDE                            = 256
 STATUS_MESSAGE_MS                          = 500
@@ -126,15 +130,65 @@ def most_recent_dir():
     recents = load_recents()
     return Path(recents[0]).resolve() if recents else None
 
+def all_recents():
+    return [Path(p).resolve() for p in load_recents()[:MAX_RECENTS]]
+
 def indexed_recents():
-    recents = [Path(p).resolve() for p in load_recents()[:MAX_RECENTS]]
-    return list(zip(RECENT_DIRECTORY_KEYS, recents))
+    return list(zip(RECENT_DIRECTORY_KEYS, all_recents()[:MAX_INDEXED_RECENTS]))
 
 def recent_dir_for_key(key: int):
     for display_key, path in indexed_recents():
         if display_key == key:
             return path
     return None
+
+def schedule_directory_chooser_resize(
+    parent,
+    width_scale: int = DIRECTORY_CHOOSER_WIDTH_SCALE,
+    height_scale: int = DIRECTORY_CHOOSER_HEIGHT_SCALE
+):
+    if parent.tk.call("tk", "windowingsystem") != "x11":
+        return
+
+    chooser_path = f"{str(parent)}.__tk_choosedir" if str(parent) != "." else ".__tk_choosedir"
+    parent.tk.eval(
+        f"""
+        namespace eval ::argus::dialogue {{}}
+        proc ::argus::dialogue::resize_directory_chooser {{w width_scale height_scale retries}} {{
+            if {{$retries <= 0}} {{
+                return
+            }}
+            if {{![winfo exists $w]}} {{
+                after 20 [list ::argus::dialogue::resize_directory_chooser $w $width_scale $height_scale [expr {{$retries - 1}}]]
+                return
+            }}
+            update idletasks
+            set base_width [winfo reqwidth $w]
+            set base_height [winfo reqheight $w]
+            if {{$base_width <= 1 || $base_height <= 1}} {{
+                after 20 [list ::argus::dialogue::resize_directory_chooser $w $width_scale $height_scale [expr {{$retries - 1}}]]
+                return
+            }}
+            set screen_width [winfo screenwidth $w]
+            set screen_height [winfo screenheight $w]
+            set target_width [expr {{min(int(round($base_width * $width_scale)), max(200, $screen_width - {DIRECTORY_CHOOSER_SCREEN_MARGIN}))}}]
+            set target_height [expr {{min(int(round($base_height * $height_scale)), max(200, $screen_height - {DIRECTORY_CHOOSER_SCREEN_MARGIN}))}}]
+            set x [expr {{max(0, ($screen_width - $target_width) / 2)}}]
+            set y [expr {{max(0, ($screen_height - $target_height) / 2)}}]
+            wm minsize $w $base_width $base_height
+            wm geometry $w "${{target_width}}x${{target_height}}+${{x}}+${{y}}"
+        }}
+        """
+    )
+    parent.tk.call(
+        "after",
+        "idle",
+        "::argus::dialogue::resize_directory_chooser",
+        chooser_path,
+        width_scale,
+        height_scale,
+        50,
+    )
 
 # utilities ------------------------------------------------------------
 
@@ -304,14 +358,14 @@ class RecentSaveDialog(Toplevel):
     """
     multi-select dialogue with:
       - filename entry (pre-filled, editable)
-      - toggle buttons for recent directories (multi-select)
+      - toggle buttons for up to 20 recent directories (multi-select)
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
       - Save button writes to all selected directories + filename
       - clear recent directories
       - Alt+digit keys 1-9,0: immediate save to that indexed recent directory
     """
-    def __init__(self, master, on_save, default_filename: str, last_selected=None):
+    def __init__(self, master, on_save, default_filename: str, last_selected=None, browse_initial_directory: Path | None = None):
         super().__init__(master)
         self.title("Save to...")
         self.resizable(False, False)
@@ -319,7 +373,8 @@ class RecentSaveDialog(Toplevel):
         self.configure(padx=12, pady=12)
         self.transient(master)
         self.grab_set()
-        self.selected_directories = set(str(p) for p in (last_selected or []))
+        self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
+        self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
 
         # filename row
         fn_frame = tk.Frame(self); fn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -330,10 +385,10 @@ class RecentSaveDialog(Toplevel):
 
         # recents header
         hdr = tk.Frame(self); hdr.grid(row=1, column=0, sticky="ew")
-        tk.Label(hdr, text="Recent directories (1-9,0)", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        tk.Label(hdr, text="Recent directories (1-9,0 for top 10)", font=("TkDefaultFont", 10, "bold")).pack(side="left")
         tk.Button(hdr, text="Clear recent directories", command=self._clear_recents).pack(side="right")
 
-        # recents grid (numbered)
+        # recents grid (top 10 numbered)
         self.btn_frame = tk.Frame(self); self.btn_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 6))
         self._render_recent_buttons()
 
@@ -410,17 +465,21 @@ class RecentSaveDialog(Toplevel):
 
     def _render_recent_buttons(self):
         for w in self.btn_frame.winfo_children(): w.destroy()
-        recents = indexed_recents()
+        recents = all_recents()
         if not recents:
             tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
             return
         columns = 2
-        for position, (display_key, p) in enumerate(recents):
+        for position, p in enumerate(recents):
             column, row = (position % columns), (position // columns)
             path = str(p)
             short = p.name or path
             active = path in self.selected_directories
-            text = f"[{display_key}] {short}\n{path}"
+            if position < MAX_INDEXED_RECENTS:
+                display_key = RECENT_DIRECTORY_KEYS[position]
+                text = f"[{display_key}] {short}\n{path}"
+            else:
+                text = f"{short}\n{path}"
             button_kwargs = {
                 "text": text,
                 "justify": "left",
@@ -453,20 +512,32 @@ class RecentSaveDialog(Toplevel):
         self._toggle_dir(str(target_directory))
         return "break"
 
+    def _browse_start_directory(self) -> str | None:
+        if self.selected_directories:
+            return sorted(self.selected_directories)[0]
+        if self.browse_initial_directory is not None:
+            return str(self.browse_initial_directory)
+        return None
+
     def _browse(self):
+        initial_directory = self._browse_start_directory()
         self.grab_release()
         try:
+            schedule_directory_chooser_resize(self)
             d = filedialog.askdirectory(
                 parent=self,
-                title="Choose a directory to save into",
+                title="Choose a directory to save to",
+                initialdir=initial_directory,
             )
         finally:
             self.lift()
             self.focus_force()
             self.grab_set()
         if d:
-            add_recent_dir(d)
-            self.selected_directories.add(str(Path(d).resolve()))
+            resolved_directory = Path(d).resolve()
+            self.browse_initial_directory = resolved_directory
+            add_recent_dir(str(resolved_directory))
+            self.selected_directories.add(str(resolved_directory))
             self._refresh_selection_ui()
             self._refresh_parent_status()
 
@@ -997,7 +1068,13 @@ class ImageViewer(tk.Tk):
     def open_save_dialog(self, event=None):
         if not self.current_image_path: return
         default_name = self.current_image_path.name
-        RecentSaveDialog(self, self._save_to_directories, default_filename=default_name, last_selected=self.last_selected_directories)
+        RecentSaveDialog(
+            self,
+            self._save_to_directories,
+            default_filename=default_name,
+            last_selected=self.last_selected_directories,
+            browse_initial_directory=self.current_image_path.parent,
+        )
 
     def _save_to_directories(self, destination_directories: list[Path], typed_name: str):
         try:
