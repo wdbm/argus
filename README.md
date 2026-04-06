@@ -1,5 +1,7 @@
 # Argus
 
+![](argus.png)
+
 Argus is an image viewer and saver with keyboard shortcuts support and the ability to save to multiple recently-used directories at once.
 
 It can
@@ -47,7 +49,7 @@ python3 -m pip install docopt pillow send2trash
 
 ## saving
 
-The save dialogue is opened with `Space` or `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons. Pressing `Enter` triggers `Save`. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry, still work in the save dialogue and save to the matching indexed recent directory.
+The save dialogue is opened with `Space` or `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons. Pressing `Enter` triggers `Save`. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry save to the matching indexed recent directory.
 
 Quick-save (`Ctrl+s`) uses the last directories selected in the save dialogue during the current session. If no directories have been selected in the current session, quick-save falls back to the most recent saved directory from the recents list. If there is no recent directory yet, quick-save opens the save dialogue instead.
 
