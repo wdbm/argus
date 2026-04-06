@@ -59,7 +59,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-03-31T1846Z"
+__VERSION__ = "2026-04-06T1954Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -79,18 +79,18 @@ STATUS_MESSAGE_MS                          = 500
 SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif"}
 
 SHORTCUT_HELP_ROWS = (
-    ("Left / Right"         , "Previous or next image"                   ),
-    ("Scroll mouse wheel"   , "Zoom at the pointer position"             ),
-    ("+, =, -, 0"           , "Zoom in, zoom out, reset zoom"            ),
-    ("Left-click and drag"  , "Pan the image"                            ),
-    ("F11/Double left-click", "Toggle full-screen"                       ),
-    ("s"                    , "Open the save dialogue"                   ),
-    ("Ctrl+s"               , "Quick-save to the last directory"         ),
-    ("Alt+1-9, 0"           , "Quick-save to an indexed recent directory"),
-    ("h"                    , "Hide or show the status bar"              ),
-    ("F1/?"                 , "Toggle this shortcuts window"             ),
-    ("Delete"               , "Move the current image to the trash"      ),
-    ("Esc"                  , "Leave full-screen or close the viewer"    ),
+    ("Left / Right"          , "Previous or next image"                   ),
+    ("Scroll mouse wheel"    , "Zoom at the pointer position"             ),
+    ("+, =, -, Ctrl+0 / KP_0", "Zoom in, zoom out, reset zoom"            ),
+    ("Left-click and drag"   , "Pan the image"                            ),
+    ("F11/Double left-click" , "Toggle full-screen"                       ),
+    ("Space / s"             , "Open the save dialogue"                   ),
+    ("Ctrl+s"                , "Quick-save to the last directory"         ),
+    ("1-9, 0"                , "Quick-save to an indexed recent directory"),
+    ("h"                     , "Hide or show the status bar"              ),
+    ("F1/?"                  , "Toggle this shortcuts window"             ),
+    ("Delete"                , "Move the current image to the trash"      ),
+    ("Esc"                   , "Leave full-screen or close the viewer"    ),
 )
 
 # recents --------------------------------------------------------------
@@ -361,6 +361,7 @@ class RecentSaveDialog(Toplevel):
       - toggle buttons for up to 20 recent directories (multi-select)
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
+      - Return: trigger the Save button
       - Save button writes to all selected directories + filename
       - clear recent directories
       - Alt+digit keys 1-9,0: immediate save to that indexed recent directory
@@ -408,6 +409,8 @@ class RecentSaveDialog(Toplevel):
         # dialogue-local hotkeys
         self.bind("<s>", self._handle_save_keypress)
         self.bind("<S>", self._handle_save_keypress)
+        self.bind("<Return>", self._trigger_save_button)
+        self.bind("<KP_Enter>", self._trigger_save_button)
         self.bind("<Escape>", self._cancel)
         self.bind("<Tab>", self._focus_next_widget)
         self.bind("<ISO_Left_Tab>", self._focus_previous_widget)
@@ -573,6 +576,11 @@ class RecentSaveDialog(Toplevel):
         self._do_save()
         return "break"
 
+    def _trigger_save_button(self, event=None):
+        if str(self.save_btn.cget("state")) != "disabled":
+            self.save_btn.invoke()
+        return "break"
+
     def _do_save(self):
         if not self.selected_directories:
             messagebox.showwarning("Choose directories", "Please select at least one directory.", parent=self)
@@ -696,10 +704,11 @@ class ImageViewer(tk.Tk):
         self.bind("<Left>", self.prev_image)
         self.bind("<Delete>", self.delete_to_trash)
         self.bind("<s>", self.open_save_dialog)
+        self.bind("<space>", self.open_save_dialog)
         self.bind("h", self.toggle_status_bar)
         self.bind("<Control-s>", self.quick_save)
         for n in range(10):
-            self.bind(f"<Alt-KeyPress-{n}>", lambda e, k=n: self.quick_save_to_index(k))
+            self.bind(f"<KeyPress-{n}>", lambda e, k=n: self.quick_save_to_index(k))
         self.bind("<F11>", self.toggle_fullscreen)
         self.bind("<F1>", self.toggle_help_dialog)
         self.bind("?", self.toggle_help_dialog)
@@ -711,11 +720,10 @@ class ImageViewer(tk.Tk):
         weq = lambda e: self.zoom_in_center()
         self.bind("=", weq)
         self.bind("-", lambda e: self.zoom_out_center())
-        self.bind("0", lambda e: self.zoom_reset())
         self.bind("<Key-plus>", lambda e: self.zoom_in_center())
         self.bind("<Key-equal>", lambda e: self.zoom_in_center())
         self.bind("<Key-minus>", lambda e: self.zoom_out_center())
-        self.bind("<Key-0>", lambda e: self.zoom_reset())
+        self.bind("<Control-KeyPress-0>", lambda e: self.zoom_reset())
         self.bind("<KP_Add>", lambda e: self.zoom_in_center())
         self.bind("<KP_Subtract>", lambda e: self.zoom_out_center())
         self.bind("<KP_0>", lambda e: self.zoom_reset())

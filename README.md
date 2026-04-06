@@ -11,7 +11,7 @@ It can
 - render larger images efficiently with viewport cropping, mipmaps and progressive refinement,
 - save the current image to one or more recent directories,
 - quick-save to the last selected or most recent directory with `Ctrl+s`,
-- save to indexed recent directories with `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry, and
+- save to indexed recent directories with `1` to `9`, and `0` for the tenth entry, and
 - move the current image to the system trash.
 
 ## setup
@@ -34,12 +34,12 @@ python3 -m pip install docopt pillow send2trash
 |-----------------------------------------------|---------------------------------------------------------------|
 |`Left`/`Right`                                 |move to the previous or next image                             |
 |scroll mouse wheel                             |zoom in or out at the pointer position                         |
-|`+`, `=`, `-`, `0`                             |zoom in, zoom out, or reset zoom                               |
+|`+`, `=`, `-`, `Ctrl+0`/numpad `0`             |zoom in, zoom out, or reset zoom                               |
 |left-click and drag                            |pan the image                                                  |
 |`F11`/double left-click                        |toggle full-screen mode                                        |
-|`s`                                            |open save dialogue                                             |
+|`Space`/`s`                                    |open save dialogue                                             |
 |`Ctrl+s`                                       |quick-save to last selected or most recent directory           |
-|`Alt+1` to `Alt+9`, `Alt+0` for the tenth entry|save directly to the indexed recent directory                  |
+|`1` to `9`, `0` for the tenth entry            |save directly to the indexed recent directory                  |
 |`h`                                            |hide or show the bottom status bar                             |
 |`F1`/`?`                                       |show or hide the shortcuts help window                         |
 |`Delete`                                       |move current image to trash                                    |
@@ -47,7 +47,7 @@ python3 -m pip install docopt pillow send2trash
 
 ## saving
 
-The save dialogue is opened with `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry, work in the save dialogue and save to the matching indexed recent directory.
+The save dialogue is opened with `Space` or `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons. Pressing `Enter` triggers `Save`. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry, still work in the save dialogue and save to the matching indexed recent directory.
 
 Quick-save (`Ctrl+s`) uses the last directories selected in the save dialogue during the current session. If no directories have been selected in the current session, quick-save falls back to the most recent saved directory from the recents list. If there is no recent directory yet, quick-save opens the save dialogue instead.
 
