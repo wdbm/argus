@@ -59,7 +59,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-06T1954Z"
+__VERSION__ = "2026-04-08T1605Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -68,6 +68,8 @@ RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_d
 MAX_RECENTS                                = 20
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
 MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
+RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL = "alphabetical"
+RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT  = "most_recent"
 RECENT_DIRECTORY_BUTTON_SELECTED_BG        = "#a5a5a5"
 RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG = "#8e8e8e"
 DIRECTORY_CHOOSER_WIDTH_SCALE              = 2
@@ -359,23 +361,50 @@ class RecentSaveDialog(Toplevel):
     multi-select dialogue with:
       - filename entry (pre-filled, editable)
       - toggle buttons for up to 20 recent directories (multi-select)
+      - radio buttons to list recent directories alphabetically or by recency
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
+      - Move checkbutton for removing the original after transfer
+      - Escape: close the dialogue
       - Return: trigger the Save button
       - Save button writes to all selected directories + filename
       - clear recent directories
       - Alt+digit keys 1-9,0: immediate save to that indexed recent directory
     """
-    def __init__(self, master, on_save, default_filename: str, last_selected=None, browse_initial_directory: Path | None = None):
+    def __init__(
+        self,
+        master,
+        on_save,
+        default_filename: str,
+        last_selected=None,
+        browse_initial_directory: Path | None = None,
+        move_selected: bool = False,
+        on_move_state_change=None,
+        recent_directory_listing_mode: str = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
+        on_recent_directory_listing_mode_change=None,
+    ):
         super().__init__(master)
         self.title("Save to...")
         self.resizable(False, False)
         self.on_save = on_save
+        self.on_move_state_change = on_move_state_change
+        self.on_recent_directory_listing_mode_change = on_recent_directory_listing_mode_change
         self.configure(padx=12, pady=12)
         self.transient(master)
         self.grab_set()
         self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
         self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
+        self.move_var = tk.BooleanVar(value=move_selected)
+        self.recent_directory_listing_mode_var = tk.StringVar(
+            value=(
+                recent_directory_listing_mode
+                if recent_directory_listing_mode in {
+                    RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
+                    RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT,
+                }
+                else RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL
+            )
+        )
 
         # filename row
         fn_frame = tk.Frame(self); fn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -386,8 +415,30 @@ class RecentSaveDialog(Toplevel):
 
         # recents header
         hdr = tk.Frame(self); hdr.grid(row=1, column=0, sticky="ew")
-        tk.Label(hdr, text="Recent directories (1-9,0 for top 10)", font=("TkDefaultFont", 10, "bold")).pack(side="left")
-        tk.Button(hdr, text="Clear recent directories", command=self._clear_recents).pack(side="right")
+        tk.Label(hdr, text="Recent directories (1-9,0 for first 10 shown)", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        clear_recents_btn = tk.Button(hdr, text="Clear recent directories", command=self._clear_recents)
+        clear_recents_btn.pack(side="right")
+        self._bind_escape_to_widget(clear_recents_btn)
+        sort_frame = tk.Frame(hdr)
+        sort_frame.pack(side="right", padx=(0, 10))
+        alphabetical_btn = tk.Radiobutton(
+            sort_frame,
+            text="List alphabetically",
+            variable=self.recent_directory_listing_mode_var,
+            value=RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
+            command=self._change_recent_directory_listing_mode,
+        )
+        alphabetical_btn.pack(side="left")
+        self._bind_escape_to_widget(alphabetical_btn)
+        most_recent_btn = tk.Radiobutton(
+            sort_frame,
+            text="List by most recent",
+            variable=self.recent_directory_listing_mode_var,
+            value=RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT,
+            command=self._change_recent_directory_listing_mode,
+        )
+        most_recent_btn.pack(side="left", padx=(8, 0))
+        self._bind_escape_to_widget(most_recent_btn)
 
         # recents grid (top 10 numbered)
         self.btn_frame = tk.Frame(self); self.btn_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 6))
@@ -401,10 +452,24 @@ class RecentSaveDialog(Toplevel):
 
         # controls
         ctl = tk.Frame(self); ctl.grid(row=4, column=0, sticky="ew")
+        ctl.grid_columnconfigure(3, weight=1)
+        browse_btn = tk.Button(ctl, text="Browse...", command=self._browse)
+        browse_btn.grid(row=0, column=0, sticky="w")
+        self._bind_escape_to_widget(browse_btn)
+        cancel_btn = tk.Button(ctl, text="Cancel", command=self._cancel)
+        cancel_btn.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self._bind_escape_to_widget(cancel_btn)
+        move_btn = tk.Checkbutton(
+            ctl,
+            text="Move",
+            variable=self.move_var,
+            command=self._store_move_state,
+        )
+        move_btn.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self._bind_escape_to_widget(move_btn)
         self.save_btn = tk.Button(ctl, text="Save", state="disabled", command=self._do_save)
-        self.save_btn.pack(side="right")
-        tk.Button(ctl, text="Browse...", command=self._browse).pack(side="left", padx=(0, 6))
-        tk.Button(ctl, text="Cancel", command=self._cancel).pack(side="left")
+        self.save_btn.grid(row=0, column=4, sticky="e")
+        self._bind_escape_to_widget(self.save_btn)
 
         # dialogue-local hotkeys
         self.bind("<s>", self._handle_save_keypress)
@@ -427,6 +492,8 @@ class RecentSaveDialog(Toplevel):
         self.geometry(f"+{x}+{y}")
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.after_idle(self.focus_set)
+        self._bind_escape_to_widget(self)
+        self._bind_escape_to_widget(self.fn_entry)
 
         self._update_save_state()
 
@@ -466,9 +533,28 @@ class RecentSaveDialog(Toplevel):
             target.focus_set()
         return "break"
 
+    def _bind_escape_to_widget(self, widget):
+        widget.bind("<Escape>", self._cancel, add="+")
+
+    def _listed_recent_directories(self):
+        recents = all_recents()
+        if self.recent_directory_listing_mode_var.get() == RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL:
+            return sorted(recents, key=lambda path: str(path).casefold())
+        return recents
+
+    def _recent_directory_for_key(self, key: int):
+        for display_key, path in zip(RECENT_DIRECTORY_KEYS, self._listed_recent_directories()[:MAX_INDEXED_RECENTS]):
+            if display_key == key:
+                return path
+        return None
+
+    def _change_recent_directory_listing_mode(self):
+        self._store_recent_directory_listing_mode()
+        self._render_recent_buttons()
+
     def _render_recent_buttons(self):
         for w in self.btn_frame.winfo_children(): w.destroy()
-        recents = all_recents()
+        recents = self._listed_recent_directories()
         if not recents:
             tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
             return
@@ -497,6 +583,7 @@ class RecentSaveDialog(Toplevel):
                     "activebackground": RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG,
                 })
             b = tk.Button(self.btn_frame, **button_kwargs)
+            self._bind_escape_to_widget(b)
             b.grid(row=row, column=column, padx=4, pady=4, sticky="ew")
 
     def _toggle_dir(self, path):
@@ -509,7 +596,7 @@ class RecentSaveDialog(Toplevel):
     def _toggle_index(self, idx: int):
         if self._focus_is_text_input():
             return None
-        target_directory = recent_dir_for_key(idx)
+        target_directory = self._recent_directory_for_key(idx)
         if target_directory is None:
             return "break"
         self._toggle_dir(str(target_directory))
@@ -554,20 +641,31 @@ class RecentSaveDialog(Toplevel):
             self._refresh_selection_ui()
             self._refresh_parent_status()
 
+    def _store_move_state(self):
+        if self.on_move_state_change is not None:
+            self.on_move_state_change(bool(self.move_var.get()))
+
+    def _store_recent_directory_listing_mode(self):
+        if self.on_recent_directory_listing_mode_change is not None:
+            self.on_recent_directory_listing_mode_change(self.recent_directory_listing_mode_var.get())
+
     def _close_dialog(self):
+        self._store_move_state()
+        self._store_recent_directory_listing_mode()
         self.grab_release()
         self.destroy()
 
     def _save_to_index(self, idx: int):
-        target_directory = recent_dir_for_key(idx)
+        target_directory = self._recent_directory_for_key(idx)
         if target_directory is None:
             return "break"
         name = sanitise_filename(self.fn_var.get())
         if not name:
             messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
             return "break"
+        move_requested = bool(self.move_var.get())
         self._close_dialog()
-        self.on_save([target_directory], name)
+        self.on_save([target_directory], name, move_requested)
         return "break"
 
     def _handle_save_keypress(self, event=None):
@@ -589,9 +687,10 @@ class RecentSaveDialog(Toplevel):
         if not name:
             messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
             return
+        move_requested = bool(self.move_var.get())
         self._close_dialog()
         directories = [Path(p).resolve() for p in self.selected_directories]
-        self.on_save(directories, name)
+        self.on_save(directories, name, move_requested)
 
     def _cancel(self):
         self._close_dialog()
@@ -692,6 +791,8 @@ class ImageViewer(tk.Tk):
         self.oy = 0
         self.drag_start = None
         self.last_selected_directories = []
+        self.save_dialog_move_selected = False
+        self.recent_directory_listing_mode = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL
         self.auto_center_on_resize = True
 
         # progressive render / debounce
@@ -1039,19 +1140,65 @@ class ImageViewer(tk.Tk):
         self.toggle_fullscreen(event)
 
     # save flow --------------------------------------------------------
-    def _copy_current_image_to_directories(self, destination_directories: list[Path], name: str):
+    def _transfer_current_image_to_directories(
+        self,
+        destination_directories: list[Path],
+        name: str,
+        move_requested: bool = False,
+    ):
         src = self.current_image_path
         saved_directories = []
         errors = []
-        for destination_directory in [Path(d).resolve() for d in destination_directories]:
+        destination_directories = [Path(d).resolve() for d in destination_directories]
+        if src is None:
+            return saved_directories, [("(current image)", "No current image is available.")]
+
+        if move_requested and len(destination_directories) == 1:
+            destination_directory = destination_directories[0]
             try:
                 destination_directory.mkdir(parents=True, exist_ok=True)
-                add_recent_dir(str(destination_directory))
                 dst = unique_destination_path(destination_directory, name)
-                shutil.copy2(src, dst)
+                shutil.move(str(src), str(dst))
+                add_recent_dir(str(destination_directory))
                 saved_directories.append(destination_directory)
             except Exception as e:
                 errors.append((str(destination_directory), str(e)))
+            return saved_directories, errors
+
+        created_paths = []
+        for destination_directory in destination_directories:
+            try:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                dst = unique_destination_path(destination_directory, name)
+                shutil.copy2(src, dst)
+                add_recent_dir(str(destination_directory))
+                saved_directories.append(destination_directory)
+                created_paths.append(dst)
+            except Exception as e:
+                errors.append((str(destination_directory), str(e)))
+                if move_requested:
+                    for created_path in reversed(created_paths):
+                        try:
+                            created_path.unlink()
+                        except Exception:
+                            pass
+                    return [], errors
+
+        if move_requested:
+            # A single file cannot be moved directly to multiple directories.
+            # One copies to each destination first and removes the original
+            # only after every copy succeeds.
+            try:
+                src.unlink()
+            except Exception as e:
+                for created_path in reversed(created_paths):
+                    try:
+                        created_path.unlink()
+                    except Exception:
+                        pass
+                errors.append((str(src), f"Could not remove the original file after copying: {e}"))
+                return [], errors
+
         return saved_directories, errors
 
     def _format_directory_summary(self, directories: list[Path]):
@@ -1062,16 +1209,62 @@ class ImageViewer(tk.Tk):
             return f"{labels[0]} and {labels[1]}"
         return f"{labels[0]}, {labels[1]}, and {len(labels) - 2} others"
 
-    def _show_save_result(self, saved_directories: list[Path], errors: list[tuple[str, str]], name: str):
+    def _show_transfer_result(
+        self,
+        saved_directories: list[Path],
+        errors: list[tuple[str, str]],
+        name: str,
+        move_requested: bool = False,
+    ):
+        action = "move" if move_requested else "save"
+        action_past = "moved" if move_requested else "saved"
         if errors and saved_directories:
-            messagebox.showwarning("Partial save", f"Saved to {len(saved_directories)} directory(ies), but {len(errors)} failed.")
+            messagebox.showwarning(f"Partial {action}", f"{action_past.capitalize()} to {len(saved_directories)} directory(ies), but {len(errors)} failed.")
         elif errors:
-            messagebox.showerror("Save failed", "\n".join([f"{d}: {e}" for d, e in errors]))
+            messagebox.showerror(f"{action.capitalize()} failed", "\n".join([f"{d}: {e}" for d, e in errors]))
         if saved_directories:
             self._refresh_status_recents()
             noun = "directory" if len(saved_directories) == 1 else "directories"
             summary = self._format_directory_summary(saved_directories)
-            self._show_status_message(f"{name} saved to {noun} {summary}.")
+            self._show_status_message(f"{name} {action_past} to {noun} {summary}.")
+
+    def _set_save_dialog_move_selected(self, move_selected: bool):
+        self.save_dialog_move_selected = bool(move_selected)
+
+    def _set_recent_directory_listing_mode(self, listing_mode: str):
+        if listing_mode not in {
+            RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
+            RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT,
+        }:
+            return
+        self.recent_directory_listing_mode = listing_mode
+
+    def _clear_current_image_display(self):
+        self.canvas.delete("all")
+        self.canvas_img_id = None
+        self.current_image_path = None
+        self.current_img = None
+        self.current_levels = []
+        self.current_future = None
+        self.current_photo = None
+        self.title("Argus -- (no images)")
+
+    def _remove_image_from_view(self, victim: Path, advance_to_next: bool = True):
+        self.cache.discard(victim)
+        try:
+            idx = self.files.index(victim)
+        except ValueError:
+            idx = self.i
+        self.files = [p for p in self.files if p != victim]
+        if not self.files:
+            self.i = 0
+            self._clear_current_image_display()
+            return
+        if advance_to_next:
+            self.i = idx % len(self.files)
+        else:
+            self.i = (max(0, idx) - 1) % len(self.files)
+        self._show_current()
 
     def open_save_dialog(self, event=None):
         if not self.current_image_path: return
@@ -1082,9 +1275,18 @@ class ImageViewer(tk.Tk):
             default_filename=default_name,
             last_selected=self.last_selected_directories,
             browse_initial_directory=self.current_image_path.parent,
+            move_selected=self.save_dialog_move_selected,
+            on_move_state_change=self._set_save_dialog_move_selected,
+            recent_directory_listing_mode=self.recent_directory_listing_mode,
+            on_recent_directory_listing_mode_change=self._set_recent_directory_listing_mode,
         )
 
-    def _save_to_directories(self, destination_directories: list[Path], typed_name: str):
+    def _save_to_directories(
+        self,
+        destination_directories: list[Path],
+        typed_name: str,
+        move_requested: bool = False,
+    ):
         try:
             src_ext = self.current_image_path.suffix
             name = sanitise_filename(typed_name)
@@ -1092,10 +1294,18 @@ class ImageViewer(tk.Tk):
                 name = f"{name}{src_ext}"
 
             self.last_selected_directories = [Path(d).resolve() for d in destination_directories]
-            saved_directories, errors = self._copy_current_image_to_directories(self.last_selected_directories, name)
-            self._show_save_result(saved_directories, errors, name)
+            victim = self.current_image_path.resolve()
+            saved_directories, errors = self._transfer_current_image_to_directories(
+                self.last_selected_directories,
+                name,
+                move_requested=move_requested,
+            )
+            self._show_transfer_result(saved_directories, errors, name, move_requested=move_requested)
+            if move_requested and saved_directories and not errors:
+                self._remove_image_from_view(victim, advance_to_next=True)
         except Exception as e:
-            messagebox.showerror("Save failed", str(e))
+            action = "Move" if move_requested else "Save"
+            messagebox.showerror(f"{action} failed", str(e))
 
     def quick_save(self, event=None):
         if not self.current_image_path: return
@@ -1108,16 +1318,16 @@ class ImageViewer(tk.Tk):
                 return self.open_save_dialog()
 
         name = self.current_image_path.name
-        saved_directories, errors = self._copy_current_image_to_directories(targets, name)
-        self._show_save_result(saved_directories, errors, name)
+        saved_directories, errors = self._transfer_current_image_to_directories(targets, name)
+        self._show_transfer_result(saved_directories, errors, name)
 
     def quick_save_to_index(self, idx: int):
         if not self.current_image_path: return
         target_directory = recent_dir_for_key(idx)
         if target_directory is None: return
         name = self.current_image_path.name
-        saved_directories, errors = self._copy_current_image_to_directories([target_directory], name)
-        self._show_save_result(saved_directories, errors, name)
+        saved_directories, errors = self._transfer_current_image_to_directories([target_directory], name)
+        self._show_transfer_result(saved_directories, errors, name)
 
     # delete (to trash) ------------------------------------------------
     def delete_to_trash(self, event=None):
@@ -1133,24 +1343,8 @@ class ImageViewer(tk.Tk):
         except Exception as e:
             messagebox.showerror("Delete failed", f"Could not move to trash:\n{e}")
             return
-        self.cache.discard(victim)
-        try:
-            idx = self.files.index(victim)
-        except ValueError:
-            idx = self.i
-        self.files = [p for p in self.files if p != victim]
         deleted_name = victim.name
-        if not self.files:
-            self.canvas.delete("all")
-            self.canvas_img_id = None
-            self.current_image_path = None
-            self.current_img = None
-            self.current_levels = []
-            self.title("Argus -- (no images)")
-            self._show_status_message(f"Moved {deleted_name} to trash.")
-            return
-        self.i = (max(0, idx) - 1) % len(self.files)
-        self._show_current()
+        self._remove_image_from_view(victim, advance_to_next=False)
         self._show_status_message(f"Moved {deleted_name} to trash.")
 
     # status bar -------------------------------------------------------

@@ -49,7 +49,7 @@ python3 -m pip install docopt pillow send2trash
 
 ## saving
 
-The save dialogue is opened with `Space` or `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons. Pressing `Enter` triggers `Save`. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry save to the matching indexed recent directory.
+The save dialogue is opened with `Space` or `s` and allows one to edit the filename and save to multiple directories at once. It shows up to 20 recent directories as clickable buttons, with radio buttons to list them alphabetically or by most recent use; alphabetical listing is selected by default. The dialogue-local `1` to `9` and `0` shortcuts apply to the first ten directories currently shown. A `Move` checkbutton sits between `Cancel` and `Save`; when it is enabled, Argus removes the current source image after transferring it, and then advances to the next image or clears the viewer if none remain. The `Move` state is kept only for the current Argus session. Pressing `Enter` triggers `Save`, and `Escape` closes the dialogue. `Alt+1` to `Alt+9`, and `Alt+0` for the tenth entry save to the matching indexed recent directory.
 
 Quick-save (`Ctrl+s`) uses the last directories selected in the save dialogue during the current session. If no directories have been selected in the current session, quick-save falls back to the most recent saved directory from the recents list. If there is no recent directory yet, quick-save opens the save dialogue instead.
 
