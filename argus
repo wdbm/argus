@@ -59,13 +59,14 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-08T1605Z"
+__VERSION__ = "2026-04-15T1443Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
 CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
-MAX_RECENTS                                = 20
+MAX_RECENTS                                = 60
+RECENT_DIRECTORY_PANE_HEIGHT               = 320
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
 MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
 RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL = "alphabetical"
@@ -360,7 +361,7 @@ class RecentSaveDialog(Toplevel):
     """
     multi-select dialogue with:
       - filename entry (pre-filled, editable)
-      - toggle buttons for up to 20 recent directories (multi-select)
+      - toggle buttons for up to 60 recent directories (multi-select)
       - radio buttons to list recent directories alphabetically or by recency
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
@@ -392,6 +393,8 @@ class RecentSaveDialog(Toplevel):
         self.configure(padx=12, pady=12)
         self.transient(master)
         self.grab_set()
+        self._focus_restore_job = None
+        self._is_closing = False
         self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
         self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
         self.move_var = tk.BooleanVar(value=move_selected)
@@ -440,8 +443,42 @@ class RecentSaveDialog(Toplevel):
         most_recent_btn.pack(side="left", padx=(8, 0))
         self._bind_escape_to_widget(most_recent_btn)
 
-        # recents grid (top 10 numbered)
-        self.btn_frame = tk.Frame(self); self.btn_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 6))
+        # scrollable recents grid (top 10 shown with numeric shortcuts)
+        recents_pane = tk.Frame(self)
+        recents_pane.grid(row=2, column=0, sticky="nsew", pady=(6, 6))
+        self.recent_buttons_canvas = tk.Canvas(
+            recents_pane,
+            height=RECENT_DIRECTORY_PANE_HEIGHT,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.recent_buttons_canvas.grid(row=0, column=0, sticky="nsew")
+        recent_buttons_scrollbar = tk.Scrollbar(
+            recents_pane,
+            orient="vertical",
+            command=self.recent_buttons_canvas.yview,
+        )
+        recent_buttons_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.recent_buttons_canvas.configure(yscrollcommand=recent_buttons_scrollbar.set)
+        recents_pane.grid_columnconfigure(0, weight=1)
+        recents_pane.grid_rowconfigure(0, weight=1)
+
+        self.btn_frame = tk.Frame(self.recent_buttons_canvas)
+        self._recent_buttons_window = self.recent_buttons_canvas.create_window(
+            (0, 0),
+            window=self.btn_frame,
+            anchor="nw",
+        )
+        self.btn_frame.bind("<Configure>", self._sync_recent_buttons_scrollregion)
+        self.recent_buttons_canvas.bind("<Configure>", self._resize_recent_buttons_window)
+        self.recent_buttons_canvas.bind("<MouseWheel>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self.recent_buttons_canvas.bind("<Button-4>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self.recent_buttons_canvas.bind("<Button-5>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self.btn_frame.bind("<MouseWheel>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self.btn_frame.bind("<Button-4>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self.btn_frame.bind("<Button-5>", self._scroll_recent_buttons_on_mousewheel, add="+")
+        self._bind_escape_to_widget(self.recent_buttons_canvas)
+        self._bind_escape_to_widget(recent_buttons_scrollbar)
         self._render_recent_buttons()
 
         # selected indicator
@@ -491,7 +528,7 @@ class RecentSaveDialog(Toplevel):
         y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{x}+{y}")
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.after_idle(self.focus_set)
+        self.after_idle(self._restore_focus_to_dialog)
         self._bind_escape_to_widget(self)
         self._bind_escape_to_widget(self.fn_entry)
 
@@ -536,6 +573,51 @@ class RecentSaveDialog(Toplevel):
     def _bind_escape_to_widget(self, widget):
         widget.bind("<Escape>", self._cancel, add="+")
 
+    def _restore_focus_to_dialog(self):
+        if self._is_closing or not self.winfo_exists():
+            return
+        self.lift()
+        self.focus_force()
+        self.fn_entry.focus_force()
+        if self._focus_restore_job is not None:
+            try:
+                self.after_cancel(self._focus_restore_job)
+            except Exception:
+                pass
+        # Some window managers restore focus late after a modal or transient
+        # dialog is mapped; reassert focus once more shortly after open/return.
+        self._focus_restore_job = self.after(80, self._restore_focus_to_dialog_once)
+
+    def _restore_focus_to_dialog_once(self):
+        self._focus_restore_job = None
+        if self._is_closing or not self.winfo_exists():
+            return
+        self.lift()
+        self.focus_force()
+        self.fn_entry.focus_force()
+
+    def _sync_recent_buttons_scrollregion(self, event=None):
+        self.recent_buttons_canvas.configure(scrollregion=self.recent_buttons_canvas.bbox("all"))
+
+    def _resize_recent_buttons_window(self, event=None):
+        if event is None:
+            return
+        self.recent_buttons_canvas.itemconfigure(self._recent_buttons_window, width=event.width)
+
+    def _scroll_recent_buttons_on_mousewheel(self, event=None):
+        if event is None:
+            return None
+        if hasattr(event, "delta") and event.delta:
+            direction = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            return None
+        self.recent_buttons_canvas.yview_scroll(direction, "units")
+        return "break"
+
     def _listed_recent_directories(self):
         recents = all_recents()
         if self.recent_directory_listing_mode_var.get() == RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL:
@@ -554,6 +636,8 @@ class RecentSaveDialog(Toplevel):
 
     def _render_recent_buttons(self):
         for w in self.btn_frame.winfo_children(): w.destroy()
+        self.btn_frame.grid_columnconfigure(0, weight=1)
+        self.btn_frame.grid_columnconfigure(1, weight=1)
         recents = self._listed_recent_directories()
         if not recents:
             tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
@@ -584,6 +668,9 @@ class RecentSaveDialog(Toplevel):
                 })
             b = tk.Button(self.btn_frame, **button_kwargs)
             self._bind_escape_to_widget(b)
+            b.bind("<MouseWheel>", self._scroll_recent_buttons_on_mousewheel, add="+")
+            b.bind("<Button-4>", self._scroll_recent_buttons_on_mousewheel, add="+")
+            b.bind("<Button-5>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.grid(row=row, column=column, padx=4, pady=4, sticky="ew")
 
     def _toggle_dir(self, path):
@@ -620,9 +707,8 @@ class RecentSaveDialog(Toplevel):
                 initialdir=initial_directory,
             )
         finally:
-            self.lift()
-            self.focus_force()
             self.grab_set()
+            self._restore_focus_to_dialog()
         if d:
             resolved_directory = Path(d).resolve()
             self.browse_initial_directory = resolved_directory
@@ -640,6 +726,7 @@ class RecentSaveDialog(Toplevel):
             self.selected_directories.clear()
             self._refresh_selection_ui()
             self._refresh_parent_status()
+        self._restore_focus_to_dialog()
 
     def _store_move_state(self):
         if self.on_move_state_change is not None:
@@ -650,6 +737,13 @@ class RecentSaveDialog(Toplevel):
             self.on_recent_directory_listing_mode_change(self.recent_directory_listing_mode_var.get())
 
     def _close_dialog(self):
+        self._is_closing = True
+        if self._focus_restore_job is not None:
+            try:
+                self.after_cancel(self._focus_restore_job)
+            except Exception:
+                pass
+            self._focus_restore_job = None
         self._store_move_state()
         self._store_recent_directory_listing_mode()
         self.grab_release()
@@ -692,7 +786,7 @@ class RecentSaveDialog(Toplevel):
         directories = [Path(p).resolve() for p in self.selected_directories]
         self.on_save(directories, name, move_requested)
 
-    def _cancel(self):
+    def _cancel(self, event=None):
         self._close_dialog()
         return "break"
 
