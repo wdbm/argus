@@ -32,11 +32,13 @@
 ################################################################################
 
 Usage:
-    argus [--status-messages | --no-status-messages] [<path>]
+    argus [--config-directory=<directory>] [--status-messages | --no-status-messages] [<path>]
     argus (-h | --help)
 
 Options:
     -h, --help             Show this display.
+    --config-directory=<directory>
+                           Load configuration from this directory.
     --status-messages      Enable transient status messages.
     --no-status-messages   Disable transient status messages.
 """
@@ -59,11 +61,10 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-15T1443Z"
+__VERSION__ = "2026-04-16T0007Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
-CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
 MAX_RECENTS                                = 60
 RECENT_DIRECTORY_PANE_HEIGHT               = 320
@@ -97,6 +98,12 @@ SHORTCUT_HELP_ROWS = (
 )
 
 # recents --------------------------------------------------------------
+
+def set_configuration_directory(directory):
+    global CONFIGURATION_DIRECTORY, RECENTS_FILE
+    CONFIGURATION_DIRECTORY = Path(directory).expanduser()
+    CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    RECENTS_FILE = CONFIGURATION_DIRECTORY / "recent_directories.json"
 
 def load_recents():
     if RECENTS_FILE.exists():
@@ -1507,6 +1514,7 @@ class ImageViewer(tk.Tk):
 
 if __name__ == "__main__":
     options = docopt(__doc__, version=__VERSION__)
+    set_configuration_directory(options["--config-directory"] or CONFIGURATION_DIRECTORY)
     path = options["<path>"] or "."
     status_messages = options["--status-messages"] or not options["--no-status-messages"]
     try:
