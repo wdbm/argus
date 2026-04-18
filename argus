@@ -61,13 +61,13 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-16T0007Z"
+__VERSION__ = "2026-04-18T1723Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
-MAX_RECENTS                                = 60
-RECENT_DIRECTORY_PANE_HEIGHT               = 320
+MAX_RECENTS                                = 80
+RECENT_DIRECTORY_PANE_HEIGHT               = 800
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
 MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
 RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL = "alphabetical"
@@ -373,6 +373,7 @@ class RecentSaveDialog(Toplevel):
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
       - Move checkbutton for removing the original after transfer
+      - Open parent directory checkbutton for browsing from the parent of the default start directory
       - Escape: close the dialogue
       - Return: trigger the Save button
       - Save button writes to all selected directories + filename
@@ -388,6 +389,8 @@ class RecentSaveDialog(Toplevel):
         browse_initial_directory: Path | None = None,
         move_selected: bool = False,
         on_move_state_change=None,
+        open_parent_directory_selected: bool = False,
+        on_open_parent_directory_state_change=None,
         recent_directory_listing_mode: str = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
         on_recent_directory_listing_mode_change=None,
     ):
@@ -396,6 +399,7 @@ class RecentSaveDialog(Toplevel):
         self.resizable(False, False)
         self.on_save = on_save
         self.on_move_state_change = on_move_state_change
+        self.on_open_parent_directory_state_change = on_open_parent_directory_state_change
         self.on_recent_directory_listing_mode_change = on_recent_directory_listing_mode_change
         self.configure(padx=12, pady=12)
         self.transient(master)
@@ -405,6 +409,7 @@ class RecentSaveDialog(Toplevel):
         self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
         self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
         self.move_var = tk.BooleanVar(value=move_selected)
+        self.open_parent_directory_var = tk.BooleanVar(value=open_parent_directory_selected)
         self.recent_directory_listing_mode_var = tk.StringVar(
             value=(
                 recent_directory_listing_mode
@@ -511,6 +516,14 @@ class RecentSaveDialog(Toplevel):
         )
         move_btn.grid(row=0, column=2, sticky="w", padx=(12, 0))
         self._bind_escape_to_widget(move_btn)
+        open_parent_directory_btn = tk.Checkbutton(
+            ctl,
+            text="Open parent directory",
+            variable=self.open_parent_directory_var,
+            command=self._store_open_parent_directory_state,
+        )
+        open_parent_directory_btn.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self._bind_escape_to_widget(open_parent_directory_btn)
         self.save_btn = tk.Button(ctl, text="Save", state="disabled", command=self._do_save)
         self.save_btn.grid(row=0, column=4, sticky="e")
         self._bind_escape_to_widget(self.save_btn)
@@ -698,10 +711,16 @@ class RecentSaveDialog(Toplevel):
 
     def _browse_start_directory(self) -> str | None:
         if self.selected_directories:
-            return sorted(self.selected_directories)[0]
-        if self.browse_initial_directory is not None:
-            return str(self.browse_initial_directory)
-        return None
+            start_directory = Path(sorted(self.selected_directories)[0]).resolve()
+        elif self.browse_initial_directory is not None:
+            start_directory = self.browse_initial_directory
+        else:
+            return None
+        if bool(self.open_parent_directory_var.get()):
+            parent_directory = start_directory.parent
+            if parent_directory != start_directory:
+                start_directory = parent_directory
+        return str(start_directory)
 
     def _browse(self):
         initial_directory = self._browse_start_directory()
@@ -739,6 +758,10 @@ class RecentSaveDialog(Toplevel):
         if self.on_move_state_change is not None:
             self.on_move_state_change(bool(self.move_var.get()))
 
+    def _store_open_parent_directory_state(self):
+        if self.on_open_parent_directory_state_change is not None:
+            self.on_open_parent_directory_state_change(bool(self.open_parent_directory_var.get()))
+
     def _store_recent_directory_listing_mode(self):
         if self.on_recent_directory_listing_mode_change is not None:
             self.on_recent_directory_listing_mode_change(self.recent_directory_listing_mode_var.get())
@@ -752,6 +775,7 @@ class RecentSaveDialog(Toplevel):
                 pass
             self._focus_restore_job = None
         self._store_move_state()
+        self._store_open_parent_directory_state()
         self._store_recent_directory_listing_mode()
         self.grab_release()
         self.destroy()
@@ -893,6 +917,7 @@ class ImageViewer(tk.Tk):
         self.drag_start = None
         self.last_selected_directories = []
         self.save_dialog_move_selected = False
+        self.save_dialog_open_parent_directory_selected = False
         self.recent_directory_listing_mode = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL
         self.auto_center_on_resize = True
 
@@ -1332,6 +1357,9 @@ class ImageViewer(tk.Tk):
     def _set_save_dialog_move_selected(self, move_selected: bool):
         self.save_dialog_move_selected = bool(move_selected)
 
+    def _set_save_dialog_open_parent_directory_selected(self, open_parent_directory_selected: bool):
+        self.save_dialog_open_parent_directory_selected = bool(open_parent_directory_selected)
+
     def _set_recent_directory_listing_mode(self, listing_mode: str):
         if listing_mode not in {
             RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
@@ -1378,6 +1406,8 @@ class ImageViewer(tk.Tk):
             browse_initial_directory=self.current_image_path.parent,
             move_selected=self.save_dialog_move_selected,
             on_move_state_change=self._set_save_dialog_move_selected,
+            open_parent_directory_selected=self.save_dialog_open_parent_directory_selected,
+            on_open_parent_directory_state_change=self._set_save_dialog_open_parent_directory_selected,
             recent_directory_listing_mode=self.recent_directory_listing_mode,
             on_recent_directory_listing_mode_change=self._set_recent_directory_listing_mode,
         )
