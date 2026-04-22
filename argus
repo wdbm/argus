@@ -52,6 +52,7 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 import re
 import shutil
+import tempfile
 import tkinter as tk
 from tkinter import Toplevel, filedialog, messagebox
 
@@ -61,7 +62,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-18T1723Z"
+__VERSION__ = "2026-04-22T2101Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -211,6 +212,11 @@ def unique_destination_path(destination_directory: Path, filename: str) -> Path:
         candidate = destination_directory / f"{base} (copy {n}){ext}"
         n += 1
     return candidate
+
+def destination_path(destination_directory: Path, filename: str, overwrite: bool = False) -> Path:
+    if overwrite:
+        return destination_directory / filename
+    return unique_destination_path(destination_directory, filename)
 
 def sanitise_filename(name: str) -> str:
     name = name.strip().replace(os.sep, "")
@@ -373,6 +379,7 @@ class RecentSaveDialog(Toplevel):
       - digit keys 1-9,0: toggle the indexed recent directories
       - Browse... to add/select a directory
       - Move checkbutton for removing the original after transfer
+      - Overwrite checkbutton for replacing existing files with the same name
       - Open parent directory checkbutton for browsing from the parent of the default start directory
       - Escape: close the dialogue
       - Return: trigger the Save button
@@ -389,6 +396,8 @@ class RecentSaveDialog(Toplevel):
         browse_initial_directory: Path | None = None,
         move_selected: bool = False,
         on_move_state_change=None,
+        overwrite_selected: bool = False,
+        on_overwrite_state_change=None,
         open_parent_directory_selected: bool = False,
         on_open_parent_directory_state_change=None,
         recent_directory_listing_mode: str = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
@@ -399,6 +408,7 @@ class RecentSaveDialog(Toplevel):
         self.resizable(False, False)
         self.on_save = on_save
         self.on_move_state_change = on_move_state_change
+        self.on_overwrite_state_change = on_overwrite_state_change
         self.on_open_parent_directory_state_change = on_open_parent_directory_state_change
         self.on_recent_directory_listing_mode_change = on_recent_directory_listing_mode_change
         self.configure(padx=12, pady=12)
@@ -409,6 +419,7 @@ class RecentSaveDialog(Toplevel):
         self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
         self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
         self.move_var = tk.BooleanVar(value=move_selected)
+        self.overwrite_var = tk.BooleanVar(value=overwrite_selected)
         self.open_parent_directory_var = tk.BooleanVar(value=open_parent_directory_selected)
         self.recent_directory_listing_mode_var = tk.StringVar(
             value=(
@@ -516,16 +527,24 @@ class RecentSaveDialog(Toplevel):
         )
         move_btn.grid(row=0, column=2, sticky="w", padx=(12, 0))
         self._bind_escape_to_widget(move_btn)
+        overwrite_btn = tk.Checkbutton(
+            ctl,
+            text="Overwrite",
+            variable=self.overwrite_var,
+            command=self._store_overwrite_state,
+        )
+        overwrite_btn.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self._bind_escape_to_widget(overwrite_btn)
         open_parent_directory_btn = tk.Checkbutton(
             ctl,
             text="Open parent directory",
             variable=self.open_parent_directory_var,
             command=self._store_open_parent_directory_state,
         )
-        open_parent_directory_btn.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        open_parent_directory_btn.grid(row=0, column=4, sticky="w", padx=(12, 0))
         self._bind_escape_to_widget(open_parent_directory_btn)
         self.save_btn = tk.Button(ctl, text="Save", state="disabled", command=self._do_save)
-        self.save_btn.grid(row=0, column=4, sticky="e")
+        self.save_btn.grid(row=0, column=5, sticky="e")
         self._bind_escape_to_widget(self.save_btn)
 
         # dialogue-local hotkeys
@@ -758,6 +777,10 @@ class RecentSaveDialog(Toplevel):
         if self.on_move_state_change is not None:
             self.on_move_state_change(bool(self.move_var.get()))
 
+    def _store_overwrite_state(self):
+        if self.on_overwrite_state_change is not None:
+            self.on_overwrite_state_change(bool(self.overwrite_var.get()))
+
     def _store_open_parent_directory_state(self):
         if self.on_open_parent_directory_state_change is not None:
             self.on_open_parent_directory_state_change(bool(self.open_parent_directory_var.get()))
@@ -775,6 +798,7 @@ class RecentSaveDialog(Toplevel):
                 pass
             self._focus_restore_job = None
         self._store_move_state()
+        self._store_overwrite_state()
         self._store_open_parent_directory_state()
         self._store_recent_directory_listing_mode()
         self.grab_release()
@@ -789,8 +813,9 @@ class RecentSaveDialog(Toplevel):
             messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
             return "break"
         move_requested = bool(self.move_var.get())
+        overwrite_requested = bool(self.overwrite_var.get())
         self._close_dialog()
-        self.on_save([target_directory], name, move_requested)
+        self.on_save([target_directory], name, move_requested, overwrite_requested)
         return "break"
 
     def _handle_save_keypress(self, event=None):
@@ -813,9 +838,10 @@ class RecentSaveDialog(Toplevel):
             messagebox.showerror("Invalid name", "Please enter a filename.", parent=self)
             return
         move_requested = bool(self.move_var.get())
+        overwrite_requested = bool(self.overwrite_var.get())
         self._close_dialog()
         directories = [Path(p).resolve() for p in self.selected_directories]
-        self.on_save(directories, name, move_requested)
+        self.on_save(directories, name, move_requested, overwrite_requested)
 
     def _cancel(self, event=None):
         self._close_dialog()
@@ -917,6 +943,7 @@ class ImageViewer(tk.Tk):
         self.drag_start = None
         self.last_selected_directories = []
         self.save_dialog_move_selected = False
+        self.save_dialog_overwrite_selected = False
         self.save_dialog_open_parent_directory_selected = False
         self.recent_directory_listing_mode = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL
         self.auto_center_on_resize = True
@@ -1271,11 +1298,13 @@ class ImageViewer(tk.Tk):
         destination_directories: list[Path],
         name: str,
         move_requested: bool = False,
+        overwrite_requested: bool = False,
     ):
         src = self.current_image_path
         saved_directories = []
         errors = []
         destination_directories = [Path(d).resolve() for d in destination_directories]
+        overwritten_backups: list[tuple[Path, Path]] = []
         if src is None:
             return saved_directories, [("(current image)", "No current image is available.")]
 
@@ -1283,7 +1312,7 @@ class ImageViewer(tk.Tk):
             destination_directory = destination_directories[0]
             try:
                 destination_directory.mkdir(parents=True, exist_ok=True)
-                dst = unique_destination_path(destination_directory, name)
+                dst = destination_path(destination_directory, name, overwrite=overwrite_requested)
                 shutil.move(str(src), str(dst))
                 add_recent_dir(str(destination_directory))
                 saved_directories.append(destination_directory)
@@ -1295,7 +1324,18 @@ class ImageViewer(tk.Tk):
         for destination_directory in destination_directories:
             try:
                 destination_directory.mkdir(parents=True, exist_ok=True)
-                dst = unique_destination_path(destination_directory, name)
+                dst = destination_path(destination_directory, name, overwrite=overwrite_requested)
+                if overwrite_requested and move_requested and dst.exists():
+                    backup_file = tempfile.NamedTemporaryFile(
+                        dir=destination_directory,
+                        prefix=f".{Path(name).stem}.argus-backup-",
+                        suffix=Path(name).suffix,
+                        delete=False,
+                    )
+                    backup_path = Path(backup_file.name)
+                    backup_file.close()
+                    shutil.copy2(dst, backup_path)
+                    overwritten_backups.append((dst, backup_path))
                 shutil.copy2(src, dst)
                 add_recent_dir(str(destination_directory))
                 saved_directories.append(destination_directory)
@@ -1306,6 +1346,11 @@ class ImageViewer(tk.Tk):
                     for created_path in reversed(created_paths):
                         try:
                             created_path.unlink()
+                        except Exception:
+                            pass
+                    for restored_path, backup_path in reversed(overwritten_backups):
+                        try:
+                            shutil.move(str(backup_path), str(restored_path))
                         except Exception:
                             pass
                     return [], errors
@@ -1322,8 +1367,18 @@ class ImageViewer(tk.Tk):
                         created_path.unlink()
                     except Exception:
                         pass
+                for restored_path, backup_path in reversed(overwritten_backups):
+                    try:
+                        shutil.move(str(backup_path), str(restored_path))
+                    except Exception:
+                        pass
                 errors.append((str(src), f"Could not remove the original file after copying: {e}"))
                 return [], errors
+            for _, backup_path in reversed(overwritten_backups):
+                try:
+                    backup_path.unlink()
+                except Exception:
+                    pass
 
         return saved_directories, errors
 
@@ -1356,6 +1411,9 @@ class ImageViewer(tk.Tk):
 
     def _set_save_dialog_move_selected(self, move_selected: bool):
         self.save_dialog_move_selected = bool(move_selected)
+
+    def _set_save_dialog_overwrite_selected(self, overwrite_selected: bool):
+        self.save_dialog_overwrite_selected = bool(overwrite_selected)
 
     def _set_save_dialog_open_parent_directory_selected(self, open_parent_directory_selected: bool):
         self.save_dialog_open_parent_directory_selected = bool(open_parent_directory_selected)
@@ -1406,6 +1464,8 @@ class ImageViewer(tk.Tk):
             browse_initial_directory=self.current_image_path.parent,
             move_selected=self.save_dialog_move_selected,
             on_move_state_change=self._set_save_dialog_move_selected,
+            overwrite_selected=self.save_dialog_overwrite_selected,
+            on_overwrite_state_change=self._set_save_dialog_overwrite_selected,
             open_parent_directory_selected=self.save_dialog_open_parent_directory_selected,
             on_open_parent_directory_state_change=self._set_save_dialog_open_parent_directory_selected,
             recent_directory_listing_mode=self.recent_directory_listing_mode,
@@ -1417,6 +1477,7 @@ class ImageViewer(tk.Tk):
         destination_directories: list[Path],
         typed_name: str,
         move_requested: bool = False,
+        overwrite_requested: bool = False,
     ):
         try:
             src_ext = self.current_image_path.suffix
@@ -1430,6 +1491,7 @@ class ImageViewer(tk.Tk):
                 self.last_selected_directories,
                 name,
                 move_requested=move_requested,
+                overwrite_requested=overwrite_requested,
             )
             self._show_transfer_result(saved_directories, errors, name, move_requested=move_requested)
             if move_requested and saved_directories and not errors:
