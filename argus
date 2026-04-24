@@ -62,13 +62,15 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-22T2101Z"
+__VERSION__ = "2026-04-24T0005Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
 MAX_RECENTS                                = 80
 RECENT_DIRECTORY_PANE_HEIGHT               = 800
+RECENT_DIRECTORY_BUTTON_COLUMNS            = 4
+RECENT_DIRECTORY_BUTTON_WIDTH              = 30
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
 MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
 RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL = "alphabetical"
@@ -445,6 +447,9 @@ class RecentSaveDialog(Toplevel):
         clear_recents_btn = tk.Button(hdr, text="Clear recent directories", command=self._clear_recents)
         clear_recents_btn.pack(side="right")
         self._bind_escape_to_widget(clear_recents_btn)
+        deselect_btn = tk.Button(hdr, text="Deselect", command=self._deselect_directories)
+        deselect_btn.pack(side="right", padx=(0, 6))
+        self._bind_escape_to_widget(deselect_btn)
         sort_frame = tk.Frame(hdr)
         sort_frame.pack(side="right", padx=(0, 10))
         alphabetical_btn = tk.Radiobutton(
@@ -643,6 +648,10 @@ class RecentSaveDialog(Toplevel):
             return
         self.recent_buttons_canvas.itemconfigure(self._recent_buttons_window, width=event.width)
 
+    def _sync_recent_buttons_canvas_width(self):
+        self.btn_frame.update_idletasks()
+        self.recent_buttons_canvas.configure(width=max(1, self.btn_frame.winfo_reqwidth()))
+
     def _scroll_recent_buttons_on_mousewheel(self, event=None):
         if event is None:
             return None
@@ -675,13 +684,13 @@ class RecentSaveDialog(Toplevel):
 
     def _render_recent_buttons(self):
         for w in self.btn_frame.winfo_children(): w.destroy()
-        self.btn_frame.grid_columnconfigure(0, weight=1)
-        self.btn_frame.grid_columnconfigure(1, weight=1)
+        columns = max(1, int(RECENT_DIRECTORY_BUTTON_COLUMNS))
+        for column in range(columns):
+            self.btn_frame.grid_columnconfigure(column, weight=1)
         recents = self._listed_recent_directories()
         if not recents:
             tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
             return
-        columns = 2
         for position, p in enumerate(recents):
             column, row = (position % columns), (position // columns)
             path = str(p)
@@ -696,7 +705,7 @@ class RecentSaveDialog(Toplevel):
                 "text": text,
                 "justify": "left",
                 "anchor": "w",
-                "width": 44,
+                "width": max(1, int(RECENT_DIRECTORY_BUTTON_WIDTH)),
                 "relief": ("sunken" if active else "raised"),
                 "command": lambda pp=path: self._toggle_dir(pp),
             }
@@ -711,6 +720,7 @@ class RecentSaveDialog(Toplevel):
             b.bind("<Button-4>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.bind("<Button-5>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.grid(row=row, column=column, padx=4, pady=4, sticky="ew")
+        self._sync_recent_buttons_canvas_width()
 
     def _toggle_dir(self, path):
         if path in self.selected_directories:
@@ -771,6 +781,12 @@ class RecentSaveDialog(Toplevel):
             self.selected_directories.clear()
             self._refresh_selection_ui()
             self._refresh_parent_status()
+        self._restore_focus_to_dialog()
+
+    def _deselect_directories(self):
+        if self.selected_directories:
+            self.selected_directories.clear()
+            self._refresh_selection_ui()
         self._restore_focus_to_dialog()
 
     def _store_move_state(self):
