@@ -62,7 +62,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-24T0005Z"
+__VERSION__ = "2026-04-24T2007Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -926,8 +926,7 @@ class ImageViewer(tk.Tk):
 
         # status bar: indexed recent directories and transient messages
         self.status = tk.Label(self, text="", anchor="w")
-        self.status.pack(fill="x", side="bottom")
-        self.status_bar_visible = True
+        self.status_bar_visible = False
         self.status_messages_enabled = status_messages
         self._status_message = None
         self._status_message_job = None
