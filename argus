@@ -62,7 +62,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-04-24T2007Z"
+__VERSION__ = "2026-05-22T2347Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -84,6 +84,8 @@ MAX_RENDER_SIDE                            = 5000
 MIPMAP_MIN_SIDE                            = 256
 STATUS_MESSAGE_MS                          = 500
 SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif"}
+PREFETCH_NEIGHBOR_COUNT                    = 3
+CACHE_MAX_ITEMS                            = 8
 
 SHORTCUT_HELP_ROWS = (
     ("Left / Right"          , "Previous or next image"                   ),
@@ -249,7 +251,7 @@ def collect_image_paths(directory: Path):
 
 class ImageCache:
     """Small LRU cache of decoded PIL Images + mipmaps, loaded off-thread."""
-    def __init__(self, max_items=5, workers=2):
+    def __init__(self, max_items=CACHE_MAX_ITEMS, workers=2):
         self.max_items = max_items
         self.cache = OrderedDict()
         self.futures: dict[Path, Future] = {}
@@ -419,6 +421,8 @@ class RecentSaveDialog(Toplevel):
         self._focus_restore_job = None
         self._is_closing = False
         self.selected_directories = set(str(Path(p).resolve()) for p in (last_selected or []))
+        self.recent_directory_buttons: dict[str, tk.Button] = {}
+        self.recent_directory_empty_label: tk.Label | None = None
         self.browse_initial_directory = (Path(browse_initial_directory).resolve() if browse_initial_directory else None)
         self.move_var = tk.BooleanVar(value=move_selected)
         self.overwrite_var = tk.BooleanVar(value=overwrite_selected)
@@ -586,7 +590,7 @@ class RecentSaveDialog(Toplevel):
 
     def _refresh_selection_ui(self):
         self.selected_var.set(self._selected_summary())
-        self._render_recent_buttons()
+        self._refresh_recent_button_states()
         self._update_save_state()
 
 
@@ -682,20 +686,41 @@ class RecentSaveDialog(Toplevel):
         self._store_recent_directory_listing_mode()
         self._render_recent_buttons()
 
+    def _configure_recent_button_state(self, path: str):
+        button = self.recent_directory_buttons.get(path)
+        if button is None:
+            return
+        active = path in self.selected_directories
+        button.configure(
+            relief=("sunken" if active else "raised"),
+            bg=(RECENT_DIRECTORY_BUTTON_SELECTED_BG if active else button.master.cget("bg")),
+            activebackground=(
+                RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG
+                if active else button.master.cget("bg")
+            ),
+        )
+
+    def _refresh_recent_button_states(self):
+        for path in self.recent_directory_buttons:
+            self._configure_recent_button_state(path)
+
     def _render_recent_buttons(self):
-        for w in self.btn_frame.winfo_children(): w.destroy()
+        for w in self.btn_frame.winfo_children():
+            w.destroy()
+        self.recent_directory_buttons.clear()
+        self.recent_directory_empty_label = None
         columns = max(1, int(RECENT_DIRECTORY_BUTTON_COLUMNS))
         for column in range(columns):
             self.btn_frame.grid_columnconfigure(column, weight=1)
         recents = self._listed_recent_directories()
         if not recents:
-            tk.Label(self.btn_frame, text="(No recent directories yet)").pack()
+            self.recent_directory_empty_label = tk.Label(self.btn_frame, text="(No recent directories yet)")
+            self.recent_directory_empty_label.pack()
             return
         for position, p in enumerate(recents):
             column, row = (position % columns), (position // columns)
             path = str(p)
             short = p.name or path
-            active = path in self.selected_directories
             if position < MAX_INDEXED_RECENTS:
                 display_key = RECENT_DIRECTORY_KEYS[position]
                 text = f"[{display_key}] {short}\n{path}"
@@ -706,20 +731,17 @@ class RecentSaveDialog(Toplevel):
                 "justify": "left",
                 "anchor": "w",
                 "width": max(1, int(RECENT_DIRECTORY_BUTTON_WIDTH)),
-                "relief": ("sunken" if active else "raised"),
+                "relief": "raised",
                 "command": lambda pp=path: self._toggle_dir(pp),
             }
-            if active:
-                button_kwargs.update({
-                    "bg": RECENT_DIRECTORY_BUTTON_SELECTED_BG,
-                    "activebackground": RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG,
-                })
             b = tk.Button(self.btn_frame, **button_kwargs)
             self._bind_escape_to_widget(b)
             b.bind("<MouseWheel>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.bind("<Button-4>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.bind("<Button-5>", self._scroll_recent_buttons_on_mousewheel, add="+")
             b.grid(row=row, column=column, padx=4, pady=4, sticky="ew")
+            self.recent_directory_buttons[path] = b
+            self._configure_recent_button_state(path)
         self._sync_recent_buttons_canvas_width()
 
     def _toggle_dir(self, path):
@@ -727,7 +749,9 @@ class RecentSaveDialog(Toplevel):
             self.selected_directories.remove(path)
         else:
             self.selected_directories.add(path)
-        self._refresh_selection_ui()
+        self.selected_var.set(self._selected_summary())
+        self._configure_recent_button_state(path)
+        self._update_save_state()
 
     def _toggle_index(self, idx: int):
         if self._focus_is_text_input():
@@ -946,8 +970,10 @@ class ImageViewer(tk.Tk):
         self.current_future: Future | None = None
         self.current_photo = None
         self.canvas_img_id = None
+        self.canvas_message_id = None
+        self.current_display_message = None
 
-        self.cache = ImageCache(max_items=5, workers=2)
+        self.cache = ImageCache(max_items=CACHE_MAX_ITEMS, workers=2)
         self._cache_pump_job = self.after(50, self._pump_cache_updates)
         self.help_dialog = None
 
@@ -1123,6 +1149,11 @@ class ImageViewer(tk.Tk):
 
         self.current_photo = ImageTk.PhotoImage(display)
 
+        if self.canvas_message_id is not None:
+            self.canvas.delete(self.canvas_message_id)
+            self.canvas_message_id = None
+        self.current_display_message = None
+
         # where to draw it on canvas -- top-left of visible slice
         draw_x = int(max(self.ox, 0))
         draw_y = int(max(self.oy, 0))
@@ -1144,6 +1175,23 @@ class ImageViewer(tk.Tk):
         self._refine_job = None
         self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
 
+    def _show_inline_message(self, message: str):
+        self.current_img = None
+        self.current_levels = []
+        self.current_photo = None
+        self.current_display_message = message
+        self.canvas.delete("all")
+        self.canvas_img_id = None
+        self.canvas_message_id = self.canvas.create_text(
+            max(1, self.canvas.winfo_width()) // 2,
+            max(1, self.canvas.winfo_height()) // 2,
+            text=message,
+            fill="#d9d9d9",
+            justify="center",
+            width=max(200, self.canvas.winfo_width() - 80),
+            font=("TkDefaultFont", 16),
+        )
+
     def _center_image(self):
         if not self.current_img: return
         base_scale = self._fit_scale(self.current_img.width, self.current_img.height)
@@ -1162,10 +1210,11 @@ class ImageViewer(tk.Tk):
     # preload neighbors ------------------------------------------------
     def _prefetch_neighbors(self):
         if not self.files: return
-        if self.i + 1 < len(self.files):
-            self.cache.request(self.files[self.i + 1])
-        if self.i - 1 >= 0:
-            self.cache.request(self.files[self.i - 1])
+        for offset in range(1, PREFETCH_NEIGHBOR_COUNT + 1):
+            if self.i + offset < len(self.files):
+                self.cache.request(self.files[self.i + offset])
+            if self.i - offset >= 0:
+                self.cache.request(self.files[self.i - offset])
 
     def _show_current(self):
         path = self.files[self.i]
@@ -1186,8 +1235,10 @@ class ImageViewer(tk.Tk):
             try:
                 self.current_img, self.current_levels = self.current_future.result()
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to open image:\n{e}")
+                self.current_future = None
+                self._show_inline_message(f"Failed to open image\n{e}")
                 return
+            self.current_future = None
             self._center_image()
             self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
         else:
@@ -1199,6 +1250,8 @@ class ImageViewer(tk.Tk):
             if self.auto_center_on_resize:
                 self._center_image()
             self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+        elif self.current_display_message:
+            self._show_inline_message(self.current_display_message)
 
     # navigation (wrapped) ---------------------------------------------
     def next_image(self, event=None):
@@ -1444,11 +1497,13 @@ class ImageViewer(tk.Tk):
     def _clear_current_image_display(self):
         self.canvas.delete("all")
         self.canvas_img_id = None
+        self.canvas_message_id = None
         self.current_image_path = None
         self.current_img = None
         self.current_levels = []
         self.current_future = None
         self.current_photo = None
+        self.current_display_message = None
         self.title("Argus -- (no images)")
 
     def _remove_image_from_view(self, victim: Path, advance_to_next: bool = True):
