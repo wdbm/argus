@@ -62,7 +62,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-05-22T2347Z"
+__VERSION__ = "2026-05-25T1658Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -402,7 +402,7 @@ class RecentSaveDialog(Toplevel):
         on_move_state_change=None,
         overwrite_selected: bool = False,
         on_overwrite_state_change=None,
-        open_parent_directory_selected: bool = False,
+        open_parent_directory_selected: bool = True,
         on_open_parent_directory_state_change=None,
         recent_directory_listing_mode: str = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
         on_recent_directory_listing_mode_change=None,
@@ -451,9 +451,9 @@ class RecentSaveDialog(Toplevel):
         clear_recents_btn = tk.Button(hdr, text="Clear recent directories", command=self._clear_recents)
         clear_recents_btn.pack(side="right")
         self._bind_escape_to_widget(clear_recents_btn)
-        deselect_btn = tk.Button(hdr, text="Deselect", command=self._deselect_directories)
-        deselect_btn.pack(side="right", padx=(0, 6))
-        self._bind_escape_to_widget(deselect_btn)
+        cancel_btn = tk.Button(hdr, text="Cancel", command=self._cancel)
+        cancel_btn.pack(side="right", padx=(0, 6))
+        self._bind_escape_to_widget(cancel_btn)
         sort_frame = tk.Frame(hdr)
         sort_frame.pack(side="right", padx=(0, 10))
         alphabetical_btn = tk.Radiobutton(
@@ -522,12 +522,6 @@ class RecentSaveDialog(Toplevel):
         # controls
         ctl = tk.Frame(self); ctl.grid(row=4, column=0, sticky="ew")
         ctl.grid_columnconfigure(3, weight=1)
-        browse_btn = tk.Button(ctl, text="Browse...", command=self._browse)
-        browse_btn.grid(row=0, column=0, sticky="w")
-        self._bind_escape_to_widget(browse_btn)
-        cancel_btn = tk.Button(ctl, text="Cancel", command=self._cancel)
-        cancel_btn.grid(row=0, column=1, sticky="w", padx=(6, 0))
-        self._bind_escape_to_widget(cancel_btn)
         move_btn = tk.Checkbutton(
             ctl,
             text="Move",
@@ -552,8 +546,14 @@ class RecentSaveDialog(Toplevel):
         )
         open_parent_directory_btn.grid(row=0, column=4, sticky="w", padx=(12, 0))
         self._bind_escape_to_widget(open_parent_directory_btn)
+        browse_btn = tk.Button(ctl, text="Browse...", command=self._browse)
+        browse_btn.grid(row=0, column=5, sticky="e")
+        self._bind_escape_to_widget(browse_btn)
+        deselect_btn = tk.Button(ctl, text="Deselect", command=self._deselect_directories)
+        deselect_btn.grid(row=0, column=6, sticky="e", padx=(6, 0))
+        self._bind_escape_to_widget(deselect_btn)
         self.save_btn = tk.Button(ctl, text="Save", state="disabled", command=self._do_save)
-        self.save_btn.grid(row=0, column=5, sticky="e")
+        self.save_btn.grid(row=0, column=7, sticky="e", padx=(6, 0))
         self._bind_escape_to_widget(self.save_btn)
 
         # dialogue-local hotkeys
@@ -793,6 +793,7 @@ class RecentSaveDialog(Toplevel):
             self.browse_initial_directory = resolved_directory
             add_recent_dir(str(resolved_directory))
             self.selected_directories.add(str(resolved_directory))
+            self._render_recent_buttons()
             self._refresh_selection_ui()
             self._refresh_parent_status()
 
@@ -803,6 +804,7 @@ class RecentSaveDialog(Toplevel):
         if messagebox.askyesno("Clear recent directories", "Clear the recent directories list?", parent=self):
             clear_recents()
             self.selected_directories.clear()
+            self._render_recent_buttons()
             self._refresh_selection_ui()
             self._refresh_parent_status()
         self._restore_focus_to_dialog()
@@ -985,7 +987,7 @@ class ImageViewer(tk.Tk):
         self.last_selected_directories = []
         self.save_dialog_move_selected = False
         self.save_dialog_overwrite_selected = False
-        self.save_dialog_open_parent_directory_selected = False
+        self.save_dialog_open_parent_directory_selected = True
         self.recent_directory_listing_mode = RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL
         self.auto_center_on_resize = True
 
