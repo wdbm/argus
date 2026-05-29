@@ -45,8 +45,10 @@ Options:
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from docopt import docopt
 import json
+import math
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -54,6 +56,7 @@ import re
 import shutil
 import tempfile
 import tkinter as tk
+import time
 from tkinter import Toplevel, filedialog, messagebox
 
 from PIL import Image, ImageTk
@@ -62,7 +65,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-05-25T1658Z"
+__VERSION__ = "2026-05-29T2254Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -86,6 +89,7 @@ STATUS_MESSAGE_MS                          = 500
 SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif"}
 PREFETCH_NEIGHBOR_COUNT                    = 3
 CACHE_MAX_ITEMS                            = 8
+MINIMUM_ANIMATION_FRAME_MS                 = 10
 
 SHORTCUT_HELP_ROWS = (
     ("Left / Right"          , "Previous or next image"                   ),
@@ -249,6 +253,21 @@ def collect_image_paths(directory: Path):
 
 # threaded image cache -------------------------------------------------
 
+@dataclass
+class CachedFrame:
+    image: Image.Image
+    mipmaps: list[Image.Image]
+
+@dataclass
+class CachedImageData:
+    frames: list[CachedFrame]
+    durations_ms: list[int]
+    loop: int | None = None
+
+    @property
+    def is_animated(self) -> bool:
+        return len(self.frames) > 1
+
 class ImageCache:
     """Small LRU cache of decoded PIL Images + mipmaps, loaded off-thread."""
     def __init__(self, max_items=CACHE_MAX_ITEMS, workers=2):
@@ -259,20 +278,20 @@ class ImageCache:
         self.completed = SimpleQueue()
         self.closed = False
 
-    def _close_entry(self, orig: Image.Image, mips: list[Image.Image]):
+    def _close_frame(self, frame: CachedFrame):
         try:
-            orig.close()
+            frame.image.close()
         except Exception:
             pass
-        for mip in mips:
+        for mip in frame.mipmaps:
             try:
                 mip.close()
             except Exception:
                 pass
 
-    def _close_result(self, data):
-        orig, mips = data
-        self._close_entry(orig, mips)
+    def _close_result(self, data: CachedImageData):
+        for frame in data.frames:
+            self._close_frame(frame)
 
     def _build_mipmaps(self, base: Image.Image):
         mipmaps = []
@@ -287,10 +306,32 @@ class ImageCache:
 
     def _load_image(self, path: Path):
         with Image.open(path) as im:
-            im.load()
-            orig = im.copy()
-        mipmaps = self._build_mipmaps(orig)
-        return (orig, mipmaps)
+            frame_count = max(1, getattr(im, "n_frames", 1))
+            is_animated = bool(getattr(im, "is_animated", False) and frame_count > 1)
+            frames: list[CachedFrame] = []
+            durations_ms: list[int] = []
+
+            if is_animated:
+                for frame_index in range(frame_count):
+                    im.seek(frame_index)
+                    im.load()
+                    frame = im.copy()
+                    if frame.mode not in {"RGB", "RGBA"}:
+                        frame = frame.convert("RGBA")
+                    frames.append(CachedFrame(frame, self._build_mipmaps(frame)))
+                    duration_ms = int(im.info.get("duration", 100) or 100)
+                    durations_ms.append(max(MINIMUM_ANIMATION_FRAME_MS, duration_ms))
+            else:
+                im.load()
+                frame = im.copy()
+                frames.append(CachedFrame(frame, self._build_mipmaps(frame)))
+                durations_ms.append(0)
+
+            return CachedImageData(
+                frames=frames,
+                durations_ms=durations_ms,
+                loop=im.info.get("loop"),
+            )
 
     def _store_completed(self, path: Path, fut: Future):
         if self.closed:
@@ -329,8 +370,8 @@ class ImageCache:
                 continue
             self.cache[path] = data
             while len(self.cache) > self.max_items:
-                _, (orig, mips) = self.cache.popitem(last=False)
-                self._close_entry(orig, mips)
+                _, evicted = self.cache.popitem(last=False)
+                self._close_result(evicted)
 
     def request(self, path: Path) -> Future:
         self.process_completed()
@@ -357,8 +398,7 @@ class ImageCache:
             fut.cancel()
         data = self.cache.pop(path, None)
         if data:
-            orig, mips = data
-            self._close_entry(orig, mips)
+            self._close_result(data)
 
     def shutdown(self):
         self.closed = True
@@ -367,8 +407,8 @@ class ImageCache:
             if not fut.done():
                 fut.cancel()
         self.pool.shutdown(wait=False)
-        for _, (orig, mips) in list(self.cache.items()):
-            self._close_entry(orig, mips)
+        for _, data in list(self.cache.items()):
+            self._close_result(data)
         self.cache.clear()
         self.futures.clear()
 
@@ -967,8 +1007,12 @@ class ImageViewer(tk.Tk):
             except ValueError as exc:
                 raise ValueError(f"image is not available in directory listing: {initial_image_path}") from exc
         self.current_image_path = None
+        self.current_data: CachedImageData | None = None
         self.current_img = None
         self.current_levels: list[Image.Image] = []
+        self.current_frame_index = 0
+        self.current_animation_job = None
+        self.current_animation_deadline = None
         self.current_future: Future | None = None
         self.current_photo = None
         self.canvas_img_id = None
@@ -1096,6 +1140,74 @@ class ImageViewer(tk.Tk):
         else:
             self.oy = min(0.0, max(canvas_height - img_h, self.oy))
 
+    def _cancel_refine_job(self):
+        if self._refine_job:
+            try:
+                self.after_cancel(self._refine_job)
+            except Exception:
+                pass
+            self._refine_job = None
+
+    def _stop_animation(self):
+        if self.current_animation_job is not None:
+            try:
+                self.after_cancel(self.current_animation_job)
+            except Exception:
+                pass
+            self.current_animation_job = None
+        self.current_animation_deadline = None
+
+    def _current_image_is_animated(self) -> bool:
+        return bool(self.current_data is not None and self.current_data.is_animated)
+
+    def _set_current_frame(self, index: int):
+        if self.current_data is None or not self.current_data.frames:
+            self.current_img = None
+            self.current_levels = []
+            self.current_frame_index = 0
+            return
+        frame_count = len(self.current_data.frames)
+        self.current_frame_index = index % frame_count
+        frame = self.current_data.frames[self.current_frame_index]
+        self.current_img = frame.image
+        self.current_levels = frame.mipmaps
+
+    def _schedule_next_animation_frame(self):
+        if self.current_animation_job is not None:
+            try:
+                self.after_cancel(self.current_animation_job)
+            except Exception:
+                pass
+            self.current_animation_job = None
+        if not self._current_image_is_animated():
+            return
+        now = time.monotonic()
+        frame_delay_s = self.current_data.durations_ms[self.current_frame_index] / 1000.0
+        if self.current_animation_deadline is None:
+            self.current_animation_deadline = now + frame_delay_s
+        else:
+            self.current_animation_deadline += frame_delay_s
+        delay_ms = max(0, math.ceil((self.current_animation_deadline - now) * 1000.0))
+        self.current_animation_job = self.after(delay_ms, self._advance_animation_frame)
+
+    def _advance_animation_frame(self):
+        self.current_animation_job = None
+        if not self._current_image_is_animated():
+            return
+        self._set_current_frame(self.current_frame_index + 1)
+        self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=False)
+        self._schedule_next_animation_frame()
+
+    def _render_current_image(self, progressive: bool = True):
+        if self._current_image_is_animated():
+            self._cancel_refine_job()
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=False)
+            return
+        if progressive:
+            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+        else:
+            self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
+
     def _render_on_canvas(self, resample=Image.Resampling.BILINEAR, refine=False):
         if not self.current_img: return
 
@@ -1168,9 +1280,7 @@ class ImageViewer(tk.Tk):
 
         # optional refine pass
         if refine:
-            if self._refine_job:
-                try: self.after_cancel(self._refine_job)
-                except Exception: pass
+            self._cancel_refine_job()
             self._refine_job = self.after_idle(self._refine_lanczos)
 
     def _refine_lanczos(self):
@@ -1178,8 +1288,12 @@ class ImageViewer(tk.Tk):
         self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
 
     def _show_inline_message(self, message: str):
+        self._stop_animation()
+        self._cancel_refine_job()
+        self.current_data = None
         self.current_img = None
         self.current_levels = []
+        self.current_frame_index = 0
         self.current_photo = None
         self.current_display_message = message
         self.canvas.delete("all")
@@ -1220,7 +1334,13 @@ class ImageViewer(tk.Tk):
 
     def _show_current(self):
         path = self.files[self.i]
+        self._stop_animation()
+        self._cancel_refine_job()
         self.current_image_path = path
+        self.current_data = None
+        self.current_img = None
+        self.current_levels = []
+        self.current_frame_index = 0
         self.zoom = 1.0
         self.auto_center_on_resize = True
 
@@ -1235,14 +1355,16 @@ class ImageViewer(tk.Tk):
         if not self.current_future: return
         if self.current_future.done():
             try:
-                self.current_img, self.current_levels = self.current_future.result()
+                self.current_data = self.current_future.result()
             except Exception as e:
                 self.current_future = None
                 self._show_inline_message(f"Failed to open image\n{e}")
                 return
             self.current_future = None
+            self._set_current_frame(0)
             self._center_image()
-            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+            self._render_current_image(progressive=True)
+            self._schedule_next_animation_frame()
         else:
             self.after(10, self._check_current_future)
 
@@ -1251,7 +1373,7 @@ class ImageViewer(tk.Tk):
             # keep fit-to-window images centred after resize unless view was adjusted manually
             if self.auto_center_on_resize:
                 self._center_image()
-            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+            self._render_current_image(progressive=True)
         elif self.current_display_message:
             self._show_inline_message(self.current_display_message)
 
@@ -1306,9 +1428,9 @@ class ImageViewer(tk.Tk):
         self.oy = cy - img_y * new_scale
 
         if progressive:
-            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+            self._render_current_image(progressive=True)
         else:
-            self._render_on_canvas(resample=Image.Resampling.LANCZOS, refine=False)
+            self._render_current_image(progressive=False)
 
     def zoom_in_center(self, step=0.1):
         cw = max(1, self.canvas.winfo_width()); ch = max(1, self.canvas.winfo_height())
@@ -1322,7 +1444,7 @@ class ImageViewer(tk.Tk):
         self.zoom = 1.0
         self.auto_center_on_resize = True
         self._center_image()
-        self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+        self._render_current_image(progressive=True)
 
     # debounced wheel --------------------------------------------------
     def _queue_zoom_at(self, cx, cy, factor):
@@ -1356,7 +1478,7 @@ class ImageViewer(tk.Tk):
         sx, sy, ox0, oy0 = self.drag_start
         self.ox = ox0 + (event.x - sx)
         self.oy = oy0 + (event.y - sy)
-        self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=False)
+        self._render_current_image(progressive=False)
 
     def _toggle_fullscreen_from_double_click(self, event=None):
         self.drag_start = None
@@ -1497,12 +1619,16 @@ class ImageViewer(tk.Tk):
         self.recent_directory_listing_mode = listing_mode
 
     def _clear_current_image_display(self):
+        self._stop_animation()
+        self._cancel_refine_job()
         self.canvas.delete("all")
         self.canvas_img_id = None
         self.canvas_message_id = None
         self.current_image_path = None
+        self.current_data = None
         self.current_img = None
         self.current_levels = []
+        self.current_frame_index = 0
         self.current_future = None
         self.current_photo = None
         self.current_display_message = None
@@ -1624,7 +1750,7 @@ class ImageViewer(tk.Tk):
         if self.current_img and self.canvas.winfo_width() > 1 and self.canvas.winfo_height() > 1:
             if self.auto_center_on_resize:
                 self._center_image()
-            self._render_on_canvas(resample=Image.Resampling.BILINEAR, refine=True)
+            self._render_current_image(progressive=True)
 
     def _default_status_text(self):
         recents = indexed_recents()
@@ -1661,6 +1787,8 @@ class ImageViewer(tk.Tk):
 
     # shutdown ---------------------------------------------------------
     def _on_close(self):
+        self._stop_animation()
+        self._cancel_refine_job()
         if self._cache_pump_job is not None:
             try:
                 self.after_cancel(self._cache_pump_job)
