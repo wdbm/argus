@@ -47,6 +47,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from docopt import docopt
+from io import BytesIO
 import json
 import math
 import os
@@ -61,11 +62,25 @@ from tkinter import Toplevel, filedialog, messagebox
 
 from PIL import Image, ImageTk
 try:
+    import cairo
+except Exception:
+    cairo = None
+try:
+    import gi
+    gi.require_version("Rsvg", "2.0")
+    from gi.repository import Rsvg
+except Exception:
+    Rsvg = None
+try:
+    import cairosvg
+except Exception:
+    cairosvg = None
+try:
     from send2trash import send2trash
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-05-29T2254Z"
+__VERSION__ = "2026-05-29T2305Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -86,10 +101,13 @@ DIRECTORY_CHOOSER_SCREEN_MARGIN            = 80
 MAX_RENDER_SIDE                            = 5000
 MIPMAP_MIN_SIDE                            = 256
 STATUS_MESSAGE_MS                          = 500
-SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif"}
+SUPPORTED_IMAGE_SUFFIXES                   = {".png", ".jpg", ".jpeg", ".gif", ".svg"}
 PREFETCH_NEIGHBOR_COUNT                    = 3
 CACHE_MAX_ITEMS                            = 8
 MINIMUM_ANIMATION_FRAME_MS                 = 10
+SVG_DEFAULT_RENDER_LONG_SIDE               = 2048
+SVG_FALLBACK_RENDER_SIDE                   = 1024
+SVG_RENDER_DPI                             = 96
 
 SHORTCUT_HELP_ROWS = (
     ("Left / Right"          , "Previous or next image"                   ),
@@ -251,6 +269,86 @@ def collect_image_paths(directory: Path):
     except OSError as exc:
         raise ValueError(f"could not inspect directory: {directory} ({exc})") from exc
 
+def svg_backend_available() -> bool:
+    return (Rsvg is not None and cairo is not None) or cairosvg is not None
+
+def _svg_length_to_pixels(length):
+    if Rsvg is None:
+        return None
+    scale_by_unit = {
+        Rsvg.Unit.PX: 1.0,
+        Rsvg.Unit.PT: SVG_RENDER_DPI / 72.0,
+        Rsvg.Unit.PC: SVG_RENDER_DPI / 6.0,
+        Rsvg.Unit.MM: SVG_RENDER_DPI / 25.4,
+        Rsvg.Unit.CM: SVG_RENDER_DPI / 2.54,
+        Rsvg.Unit.IN: float(SVG_RENDER_DPI),
+    }
+    scale = scale_by_unit.get(length.unit)
+    if scale is None:
+        return None
+    value = float(length.length) * scale
+    return value if value > 0 else None
+
+def _svg_intrinsic_size(handle) -> tuple[float, float]:
+    width = None
+    height = None
+    viewbox_width = None
+    viewbox_height = None
+
+    try:
+        has_width, width_length, has_height, height_length, has_viewbox, viewbox = handle.get_intrinsic_dimensions()
+        if has_width:
+            width = _svg_length_to_pixels(width_length)
+        if has_height:
+            height = _svg_length_to_pixels(height_length)
+        if has_viewbox and viewbox.width > 0 and viewbox.height > 0:
+            viewbox_width = float(viewbox.width)
+            viewbox_height = float(viewbox.height)
+    except Exception:
+        pass
+
+    if viewbox_width and viewbox_height:
+        if width is None and height is not None:
+            width = height * (viewbox_width / viewbox_height)
+        elif height is None and width is not None:
+            height = width * (viewbox_height / viewbox_width)
+        elif width is None and height is None:
+            width = viewbox_width
+            height = viewbox_height
+
+    if width is None or height is None:
+        try:
+            dimensions = handle.get_dimensions()
+            if width is None and dimensions.width > 0:
+                width = float(dimensions.width)
+            if height is None and dimensions.height > 0:
+                height = float(dimensions.height)
+        except Exception:
+            pass
+
+    if width is None and height is None:
+        width = float(SVG_FALLBACK_RENDER_SIDE)
+        height = float(SVG_FALLBACK_RENDER_SIDE)
+    elif width is None:
+        width = float(height)
+    elif height is None:
+        height = float(width)
+
+    return max(1.0, width), max(1.0, height)
+
+def _svg_render_size(handle) -> tuple[int, int]:
+    intrinsic_width, intrinsic_height = _svg_intrinsic_size(handle)
+    longest_side = max(intrinsic_width, intrinsic_height)
+    scale = 1.0
+    if longest_side < SVG_DEFAULT_RENDER_LONG_SIDE:
+        scale = SVG_DEFAULT_RENDER_LONG_SIDE / longest_side
+    elif longest_side > MAX_RENDER_SIDE:
+        scale = MAX_RENDER_SIDE / longest_side
+    return (
+        max(1, int(round(intrinsic_width * scale))),
+        max(1, int(round(intrinsic_height * scale))),
+    )
+
 # threaded image cache -------------------------------------------------
 
 @dataclass
@@ -304,7 +402,51 @@ class ImageCache:
             mipmaps.append(lvl)
         return mipmaps
 
-    def _load_image(self, path: Path):
+    def _load_svg_via_librsvg(self, path: Path):
+        if Rsvg is None or cairo is None:
+            raise RuntimeError("SVG support requires librsvg and pycairo.")
+        handle = Rsvg.Handle.new_from_file(str(path))
+        render_width, render_height = _svg_render_size(handle)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, render_width, render_height)
+        context = cairo.Context(surface)
+        viewport = Rsvg.Rectangle()
+        viewport.x = 0
+        viewport.y = 0
+        viewport.width = render_width
+        viewport.height = render_height
+        context.set_source_rgba(0, 0, 0, 0)
+        context.paint()
+        ok = handle.render_document(context, viewport)
+        if ok is False:
+            raise RuntimeError("librsvg could not render the SVG document.")
+        png_buffer = BytesIO()
+        surface.write_to_png(png_buffer)
+        png_buffer.seek(0)
+        with Image.open(png_buffer) as im:
+            im.load()
+            frame = im.copy()
+        if frame.mode not in {"RGB", "RGBA"}:
+            frame = frame.convert("RGBA")
+        return CachedImageData(
+            frames=[CachedFrame(frame, self._build_mipmaps(frame))],
+            durations_ms=[0],
+        )
+
+    def _load_svg_via_cairosvg(self, path: Path):
+        if cairosvg is None:
+            raise RuntimeError("SVG support requires either librsvg or CairoSVG.")
+        png_bytes = cairosvg.svg2png(url=str(path), dpi=SVG_RENDER_DPI)
+        with Image.open(BytesIO(png_bytes)) as im:
+            im.load()
+            frame = im.copy()
+        if frame.mode not in {"RGB", "RGBA"}:
+            frame = frame.convert("RGBA")
+        return CachedImageData(
+            frames=[CachedFrame(frame, self._build_mipmaps(frame))],
+            durations_ms=[0],
+        )
+
+    def _load_raster_image(self, path: Path):
         with Image.open(path) as im:
             frame_count = max(1, getattr(im, "n_frames", 1))
             is_animated = bool(getattr(im, "is_animated", False) and frame_count > 1)
@@ -332,6 +474,15 @@ class ImageCache:
                 durations_ms=durations_ms,
                 loop=im.info.get("loop"),
             )
+
+    def _load_image(self, path: Path):
+        if path.suffix.lower() == ".svg":
+            if Rsvg is not None and cairo is not None:
+                return self._load_svg_via_librsvg(path)
+            if cairosvg is not None:
+                return self._load_svg_via_cairosvg(path)
+            raise ValueError("SVG support is unavailable. Install librsvg/pycairo or CairoSVG.")
+        return self._load_raster_image(path)
 
     def _store_completed(self, path: Path, fut: Future):
         if self.closed:
