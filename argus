@@ -80,7 +80,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-05-29T2305Z"
+__VERSION__ = "2026-05-29T2318Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -448,8 +448,16 @@ class ImageCache:
 
     def _load_raster_image(self, path: Path):
         with Image.open(path) as im:
+            format_name = str(getattr(im, "format", "") or "").upper()
             frame_count = max(1, getattr(im, "n_frames", 1))
-            is_animated = bool(getattr(im, "is_animated", False) and frame_count > 1)
+            # Some phone "JPEG" files are exposed by Pillow as MPO containers with
+            # auxiliary frames. Decoding those extra frames can fail even though the
+            # primary image is valid, so treat MPOs as still images.
+            is_animated = bool(
+                format_name != "MPO"
+                and getattr(im, "is_animated", False)
+                and frame_count > 1
+            )
             frames: list[CachedFrame] = []
             durations_ms: list[int] = []
 
