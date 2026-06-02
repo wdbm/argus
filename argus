@@ -80,7 +80,7 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-05-29T2318Z"
+__VERSION__ = "2026-06-02T0022Z"
 
 APPLICATION_NAME                           = "argus"
 CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
@@ -191,27 +191,38 @@ def schedule_directory_chooser_resize(
     parent.tk.eval(
         f"""
         namespace eval ::argus::dialogue {{}}
-        proc ::argus::dialogue::resize_directory_chooser {{w width_scale height_scale retries}} {{
+        proc ::argus::dialogue::resize_directory_chooser {{w parent width_scale height_scale retries}} {{
             if {{$retries <= 0}} {{
                 return
             }}
             if {{![winfo exists $w]}} {{
-                after 20 [list ::argus::dialogue::resize_directory_chooser $w $width_scale $height_scale [expr {{$retries - 1}}]]
+                after 20 [list ::argus::dialogue::resize_directory_chooser $w $parent $width_scale $height_scale [expr {{$retries - 1}}]]
                 return
             }}
             update idletasks
             set base_width [winfo reqwidth $w]
             set base_height [winfo reqheight $w]
             if {{$base_width <= 1 || $base_height <= 1}} {{
-                after 20 [list ::argus::dialogue::resize_directory_chooser $w $width_scale $height_scale [expr {{$retries - 1}}]]
+                after 20 [list ::argus::dialogue::resize_directory_chooser $w $parent $width_scale $height_scale [expr {{$retries - 1}}]]
                 return
             }}
             set screen_width [winfo screenwidth $w]
             set screen_height [winfo screenheight $w]
             set target_width [expr {{min(int(round($base_width * $width_scale)), max(200, $screen_width - {DIRECTORY_CHOOSER_SCREEN_MARGIN}))}}]
             set target_height [expr {{min(int(round($base_height * $height_scale)), max(200, $screen_height - {DIRECTORY_CHOOSER_SCREEN_MARGIN}))}}]
-            set x [expr {{max(0, ($screen_width - $target_width) / 2)}}]
-            set y [expr {{max(0, ($screen_height - $target_height) / 2)}}]
+            if {{[winfo exists $parent]}} {{
+                set parent_x [winfo rootx $parent]
+                set parent_y [winfo rooty $parent]
+                set parent_width [winfo width $parent]
+                set parent_height [winfo height $parent]
+                set x [expr {{$parent_x + (($parent_width - $target_width) / 2)}}]
+                set y [expr {{$parent_y + (($parent_height - $target_height) / 2)}}]
+            }} else {{
+                set x [expr {{($screen_width - $target_width) / 2}}]
+                set y [expr {{($screen_height - $target_height) / 2}}]
+            }}
+            set x [expr {{max(0, min($x, $screen_width - $target_width))}}]
+            set y [expr {{max(0, min($y, $screen_height - $target_height))}}]
             wm minsize $w $base_width $base_height
             wm geometry $w "${{target_width}}x${{target_height}}+${{x}}+${{y}}"
         }}
@@ -222,6 +233,7 @@ def schedule_directory_chooser_resize(
         "idle",
         "::argus::dialogue::resize_directory_chooser",
         chooser_path,
+        str(parent),
         width_scale,
         height_scale,
         50,
