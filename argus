@@ -48,14 +48,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from docopt import docopt
 from io import BytesIO
-import json
 import math
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
 import re
 import shutil
-import tempfile
+import sys
 import tkinter as tk
 import time
 from tkinter import Toplevel, filedialog, messagebox
@@ -80,10 +79,31 @@ try:
 except Exception:
     send2trash = None
 
-__VERSION__ = "2026-06-02T0022Z"
+MODULE_SEARCH_PATHS = (
+    Path(__file__).resolve().parent,
+    Path(__file__).resolve().parent.parent,
+    Path.home() / ".local" / "share" / "wdbm-python",
+)
+for module_search_path in MODULE_SEARCH_PATHS:
+    if (module_search_path / "scattercaster").is_dir():
+        sys.path.insert(0, str(module_search_path))
+        break
+
+from scattercaster import (
+    RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL,
+    RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT,
+    RecentDirectoryStore,
+    TransferRequest,
+    destination_path,
+    format_directory_summary,
+    sanitise_filename,
+    transfer_to_directories,
+)
+
+__VERSION__ = "2026-06-15T2310Z"
 
 APPLICATION_NAME                           = "argus"
-CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / APPLICATION_NAME
+CONFIGURATION_DIRECTORY                    = Path.home() / ".config" / "scattercaster"
 RECENTS_FILE                               = CONFIGURATION_DIRECTORY / "recent_directories.json"
 MAX_RECENTS                                = 80
 RECENT_DIRECTORY_PANE_HEIGHT               = 800
@@ -91,8 +111,6 @@ RECENT_DIRECTORY_BUTTON_COLUMNS            = 4
 RECENT_DIRECTORY_BUTTON_WIDTH              = 30
 RECENT_DIRECTORY_KEYS                      = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
 MAX_INDEXED_RECENTS                        = len(RECENT_DIRECTORY_KEYS)
-RECENT_DIRECTORY_LISTING_MODE_ALPHABETICAL = "alphabetical"
-RECENT_DIRECTORY_LISTING_MODE_MOST_RECENT  = "most_recent"
 RECENT_DIRECTORY_BUTTON_SELECTED_BG        = "#a5a5a5"
 RECENT_DIRECTORY_BUTTON_SELECTED_ACTIVE_BG = "#8e8e8e"
 DIRECTORY_CHOOSER_WIDTH_SCALE              = 2
@@ -108,6 +126,7 @@ MINIMUM_ANIMATION_FRAME_MS                 = 10
 SVG_DEFAULT_RENDER_LONG_SIDE               = 2048
 SVG_FALLBACK_RENDER_SIDE                   = 1024
 SVG_RENDER_DPI                             = 96
+RECENT_DIRECTORY_STORE                     = RecentDirectoryStore(RECENTS_FILE, max_recents=MAX_RECENTS)
 
 SHORTCUT_HELP_ROWS = (
     ("Left / Right"          , "Previous or next image"                   ),
@@ -127,48 +146,29 @@ SHORTCUT_HELP_ROWS = (
 # recents --------------------------------------------------------------
 
 def set_configuration_directory(directory):
-    global CONFIGURATION_DIRECTORY, RECENTS_FILE
+    global CONFIGURATION_DIRECTORY, RECENTS_FILE, RECENT_DIRECTORY_STORE
     CONFIGURATION_DIRECTORY = Path(directory).expanduser()
     CONFIGURATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
     RECENTS_FILE = CONFIGURATION_DIRECTORY / "recent_directories.json"
+    RECENT_DIRECTORY_STORE = RecentDirectoryStore(RECENTS_FILE, max_recents=MAX_RECENTS)
 
 def load_recents():
-    if RECENTS_FILE.exists():
-        try:
-            data = json.loads(RECENTS_FILE.read_text())
-            return [p for p in data if Path(p).is_dir()]
-        except Exception:
-            pass
-    return []
+    return RECENT_DIRECTORY_STORE.load()
 
 def save_recents(recents):
-    try:
-        RECENTS_FILE.write_text(json.dumps(recents[:MAX_RECENTS], indent=2))
-    except Exception:
-        pass
+    RECENT_DIRECTORY_STORE.save(recents)
 
 def clear_recents():
-    try:
-        RECENTS_FILE.write_text("[]")
-    except Exception:
-        pass
+    RECENT_DIRECTORY_STORE.clear()
 
 def add_recent_dir(path_str):
-    p = Path(path_str).resolve()
-    if p.is_file(): p = p.parent
-    path_str = str(p)
-    recents = load_recents()
-    if path_str in recents: recents.remove(path_str)
-    recents.insert(0, path_str)
-    save_recents(recents)
-    return recents
+    return RECENT_DIRECTORY_STORE.add(path_str)
 
 def most_recent_dir():
-    recents = load_recents()
-    return Path(recents[0]).resolve() if recents else None
+    return RECENT_DIRECTORY_STORE.most_recent()
 
 def all_recents():
-    return [Path(p).resolve() for p in load_recents()[:MAX_RECENTS]]
+    return RECENT_DIRECTORY_STORE.all()
 
 def indexed_recents():
     return list(zip(RECENT_DIRECTORY_KEYS, all_recents()[:MAX_INDEXED_RECENTS]))
@@ -240,25 +240,6 @@ def schedule_directory_chooser_resize(
     )
 
 # utilities ------------------------------------------------------------
-
-def unique_destination_path(destination_directory: Path, filename: str) -> Path:
-    base = Path(filename).stem
-    ext = Path(filename).suffix
-    candidate = destination_directory / (base + ext)
-    n = 1
-    while candidate.exists():
-        candidate = destination_directory / f"{base} (copy {n}){ext}"
-        n += 1
-    return candidate
-
-def destination_path(destination_directory: Path, filename: str, overwrite: bool = False) -> Path:
-    if overwrite:
-        return destination_directory / filename
-    return unique_destination_path(destination_directory, filename)
-
-def sanitise_filename(name: str) -> str:
-    name = name.strip().replace(os.sep, "")
-    return re.sub(r'[\x00-\x1f<>:"|?*]', "_", name) or "image"
 
 def is_supported_image_path(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
@@ -1664,94 +1645,23 @@ class ImageViewer(tk.Tk):
         overwrite_requested: bool = False,
     ):
         src = self.current_image_path
-        saved_directories = []
-        errors = []
-        destination_directories = [Path(d).resolve() for d in destination_directories]
-        overwritten_backups: list[tuple[Path, Path]] = []
         if src is None:
-            return saved_directories, [("(current image)", "No current image is available.")]
-
-        if move_requested and len(destination_directories) == 1:
-            destination_directory = destination_directories[0]
-            try:
-                destination_directory.mkdir(parents=True, exist_ok=True)
-                dst = destination_path(destination_directory, name, overwrite=overwrite_requested)
-                shutil.move(str(src), str(dst))
-                add_recent_dir(str(destination_directory))
-                saved_directories.append(destination_directory)
-            except Exception as e:
-                errors.append((str(destination_directory), str(e)))
-            return saved_directories, errors
-
-        created_paths = []
-        for destination_directory in destination_directories:
-            try:
-                destination_directory.mkdir(parents=True, exist_ok=True)
-                dst = destination_path(destination_directory, name, overwrite=overwrite_requested)
-                if overwrite_requested and move_requested and dst.exists():
-                    backup_file = tempfile.NamedTemporaryFile(
-                        dir=destination_directory,
-                        prefix=f".{Path(name).stem}.argus-backup-",
-                        suffix=Path(name).suffix,
-                        delete=False,
-                    )
-                    backup_path = Path(backup_file.name)
-                    backup_file.close()
-                    shutil.copy2(dst, backup_path)
-                    overwritten_backups.append((dst, backup_path))
-                shutil.copy2(src, dst)
-                add_recent_dir(str(destination_directory))
-                saved_directories.append(destination_directory)
-                created_paths.append(dst)
-            except Exception as e:
-                errors.append((str(destination_directory), str(e)))
-                if move_requested:
-                    for created_path in reversed(created_paths):
-                        try:
-                            created_path.unlink()
-                        except Exception:
-                            pass
-                    for restored_path, backup_path in reversed(overwritten_backups):
-                        try:
-                            shutil.move(str(backup_path), str(restored_path))
-                        except Exception:
-                            pass
-                    return [], errors
-
-        if move_requested:
-            # A single file cannot be moved directly to multiple directories.
-            # One copies to each destination first and removes the original
-            # only after every copy succeeds.
-            try:
-                src.unlink()
-            except Exception as e:
-                for created_path in reversed(created_paths):
-                    try:
-                        created_path.unlink()
-                    except Exception:
-                        pass
-                for restored_path, backup_path in reversed(overwritten_backups):
-                    try:
-                        shutil.move(str(backup_path), str(restored_path))
-                    except Exception:
-                        pass
-                errors.append((str(src), f"Could not remove the original file after copying: {e}"))
-                return [], errors
-            for _, backup_path in reversed(overwritten_backups):
-                try:
-                    backup_path.unlink()
-                except Exception:
-                    pass
-
-        return saved_directories, errors
+            return [], [("(current image)", "No current image is available.")]
+        result = transfer_to_directories(
+            TransferRequest(
+                source_path=src,
+                destination_directories=destination_directories,
+                name=name,
+                move_requested=move_requested,
+                overwrite_requested=overwrite_requested,
+            )
+        )
+        for destination_directory in result.saved_directories:
+            add_recent_dir(str(destination_directory))
+        return result.saved_directories, result.errors
 
     def _format_directory_summary(self, directories: list[Path]):
-        labels = [d.name or str(d) for d in directories]
-        if len(labels) == 1:
-            return labels[0]
-        if len(labels) == 2:
-            return f"{labels[0]} and {labels[1]}"
-        return f"{labels[0]}, {labels[1]}, and {len(labels) - 2} others"
+        return format_directory_summary(directories)
 
     def _show_transfer_result(
         self,
